@@ -479,13 +479,12 @@ def check_bazel_version(min_version, max_version):
   Returns:
     The bazel version detected.
   """
-  bazel_executable = which('bazel')
-  if bazel_executable is None:
+  if which('bazel') is None:
     print('Cannot find bazel. Please install bazel.')
     sys.exit(1)
 
   stderr = open(os.devnull, 'wb')
-  curr_version = run_shell([bazel_executable, '--version'],
+  curr_version = run_shell(['bazel', '--version'],
                            allow_non_zero=True,
                            stderr=stderr)
   if curr_version.startswith('bazel '):
@@ -850,8 +849,7 @@ def set_gcc_host_compiler_path(environ_cp):
       environ_cp,
       var_name='GCC_HOST_COMPILER_PATH',
       var_default=default_gcc_host_compiler_path,
-      ask_for_var='Please specify which gcc should be used by nvcc as the host '
-      'compiler.',
+      ask_for_var='Please specify which gcc should be used by nvcc as the host compiler.',
       check_success=os.path.exists,
       resolve_symlinks=True,
       error_msg='Invalid gcc path. %s cannot be found.',
