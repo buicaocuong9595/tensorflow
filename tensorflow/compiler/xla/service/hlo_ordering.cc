@@ -21,14 +21,14 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
-#include "tensorflow/compiler/xla/service/hlo_computation.h"
+#include "tensorflow/compiler/xla/hlo/ir/hlo_computation.h"
 #include "tensorflow/compiler/xla/shape_util.h"
 #include "tensorflow/compiler/xla/status_macros.h"
 #include "tensorflow/compiler/xla/statusor.h"
 #include "tensorflow/compiler/xla/types.h"
 #include "tensorflow/compiler/xla/util.h"
-#include "tensorflow/core/lib/core/errors.h"
-#include "tensorflow/core/platform/logging.h"
+#include "tensorflow/tsl/platform/errors.h"
+#include "tensorflow/tsl/platform/logging.h"
 
 namespace xla {
 
@@ -143,7 +143,7 @@ HloOrdering::ExecutionConstraint HloOrdering::GetExecutionConstraint(
 
 bool HloOrdering::IsDefinedBefore(const HloValue& a, const HloValue& b) const {
   // Entry parameter should always be defined before other instructions.
-  const HloModule* module = b.defining_instruction()->parent()->parent();
+  const HloModule* module = b.defining_instruction()->GetModule();
   if (b.defining_instruction()->parent() == module->entry_computation() &&
       b.defining_instruction()->opcode() == HloOpcode::kParameter) {
     return false;
@@ -327,6 +327,19 @@ bool HloOrdering::UsesBeforeValueDefinition(
         return true;
       }
     }
+    // The use at an async call occurs before values that are defined in the
+    // called computation of the async wrapped instruction.
+    if (use.instruction->IsAsynchronous() &&
+        use.instruction->async_wrapped_opcode() == HloOpcode::kCall) {
+      const HloInstruction* async = use.instruction;
+      if (call_graph_->InstructionIsNestedIn(
+              value.defining_instruction(),
+              async->async_wrapped_instruction()->to_apply())) {
+        VLOG(4) << "  use is async " << use.instruction->name()
+                << " and def is in called computation";
+        return true;
+      }
+    }
     if (use.instruction->opcode() == HloOpcode::kConditional) {
       const HloInstruction* conditional = use.instruction;
       // In general the use of a value in the conditional parameter should be
@@ -351,7 +364,7 @@ bool HloOrdering::UsesBeforeValueDefinition(
           // surrounding loop and then back into the conditional parameter.
           if (!dataflow.ValueIsDefinedAt(
                   use.instruction->operand(use.operand_number), {})) {
-            for (auto value_use : value.uses()) {
+            for (auto value_use : value.GetUses()) {
               VLOG(4) << "def have use:" << value_use << "\n";
               if (value_use.instruction ==
                   value_use.instruction->parent()->root_instruction()) {
@@ -417,7 +430,7 @@ bool HloOrdering::LiveRangeStrictlyBefore(
 
   // All uses of 'a' must be before 'b' is defined.
   std::vector<const HloUse*> uses;
-  for (const HloUse& use : a.uses()) {
+  for (const HloUse& use : a.GetUses()) {
     if (dataflow.DoesNotUseOperandBuffer(a.instruction(), a.index(),
                                          use.instruction)) {
       continue;
@@ -430,15 +443,10 @@ bool HloOrdering::LiveRangeStrictlyBefore(
     return false;
   }
 
-  if (a.instruction()->parent() == b.instruction()->parent()) {
-    for (const HloPosition& position : a.positions()) {
-      if (position.instruction ==
-          a.instruction()->parent()->root_instruction()) {
-        VLOG(4) << a << " is live out of computation and defined before " << b
-                << " which is in same computation";
-        return false;
-      }
-    }
+  if (a.IsRootOf(b.instruction()->parent())) {
+    VLOG(4) << a << " is live out of computation and defined before " << b
+            << " which is in same computation";
+    return false;
   }
 
   return true;
@@ -462,8 +470,9 @@ bool PredecessorHloOrdering::ExecutesBeforeInSameComputation(
   return a != b && predecessors_.at(a->parent())->IsReachable(a, b);
 }
 
-string PredecessorHloOrdering::ToStringHelper(const string& name) const {
-  std::vector<string> pieces;
+std::string PredecessorHloOrdering::ToStringHelper(
+    const std::string& name) const {
+  std::vector<std::string> pieces;
   pieces.push_back(name);
   for (auto* computation : module_->MakeNonfusionComputations()) {
     pieces.push_back(absl::StrFormat("computation %s:", computation->name()));
@@ -492,7 +501,7 @@ DependencyHloOrdering::DependencyHloOrdering(const HloModule* module)
   }
 }
 
-string DependencyHloOrdering::ToString() const {
+std::string DependencyHloOrdering::ToString() const {
   return ToStringHelper("DependencyHloOrdering");
 }
 
@@ -539,7 +548,7 @@ const HloInstructionSequence* SequentialHloOrdering::SequentialOrder(
              : nullptr;
 }
 
-string SequentialHloOrdering::ToString() const {
+std::string SequentialHloOrdering::ToString() const {
   return absl::StrCat("SequentialHloOrdering\n", schedule_.ToString());
 }
 

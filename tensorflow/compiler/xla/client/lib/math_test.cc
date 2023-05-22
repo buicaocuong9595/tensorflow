@@ -26,6 +26,7 @@ limitations under the License.
 #include "tensorflow/compiler/xla/tests/test_macros.h"
 #include "tensorflow/compiler/xla/types.h"
 #include "tensorflow/compiler/xla/xla_data.pb.h"
+#include "tensorflow/tsl/lib/core/status_test_util.h"
 
 namespace xla {
 namespace {
@@ -143,7 +144,7 @@ class MathTypedTest : public MathTest {
     ComputeAndCompareR1<T>(&b, expected, {}, error_spec_);
   }
 
-  void TestErfEdgeCases() {
+  void TestErfInvEdgeCases() {
     SetFastMathDisabled(true);
 
     XlaBuilder b(TestName());
@@ -152,6 +153,23 @@ class MathTypedTest : public MathTest {
 
     const T inf(std::numeric_limits<float>::infinity());
     std::vector<T> expected = {-inf, inf, T{0}};
+
+    ComputeAndCompareR1<T>(&b, expected, {}, error_spec_);
+  }
+
+  void TestErfEdgeCases() {
+    SetFastMathDisabled(true);
+    const T kErfInvOneMinusHalfULP = T(3.832506856900711);
+    const T inf(std::numeric_limits<float>::infinity());
+
+    XlaBuilder b(TestName());
+    auto x = AddParam(LiteralUtil::CreateR1<T>({T{-inf}, T{inf}, T{-0}, T{0},
+                                                T{-kErfInvOneMinusHalfULP},
+                                                T{kErfInvOneMinusHalfULP}}),
+                      &b);
+    Erf(x);
+
+    std::vector<T> expected = {T(-1), T(1), T(-0), T(0), T(-1), T(1)};
 
     ComputeAndCompareR1<T>(&b, expected, {}, error_spec_);
   }
@@ -178,7 +196,8 @@ XLA_TYPED_TEST(MathTypedTest, IsNegZero) { this->TestIsNegZero(); }
 XLA_TYPED_TEST(MathTypedTest, SqrtPowInequivalence) {
   this->TestSqrtPowInequivalence();
 }
-XLA_TYPED_TEST(MathTypedTest, ErfInvEdgeCases) { this->TestErfEdgeCases(); }
+XLA_TYPED_TEST(MathTypedTest, ErfInvEdgeCases) { this->TestErfInvEdgeCases(); }
+XLA_TYPED_TEST(MathTypedTest, ErfEdgeCases) { this->TestErfEdgeCases(); }
 
 // Check that certain ops only support real, floating-point inputs.
 //
@@ -188,6 +207,10 @@ XLA_TEST_F(MathTest, RealFpOnlyOps) {
     auto ty = static_cast<PrimitiveType>(i);
     SCOPED_TRACE(PrimitiveType_Name(ty));
     Shape shape;
+    if (ty == U4 || ty == S4) {
+      // TODO(b/259306620): breaking MakeShape()
+      continue;
+    }
     if (primitive_util::IsArrayType(ty)) {
       shape = ShapeUtil::MakeShape(ty, {42});
     } else if (ty == PrimitiveType::TUPLE) {
@@ -201,7 +224,7 @@ XLA_TEST_F(MathTest, RealFpOnlyOps) {
     }
 
     for (const auto& test :
-         std::vector<std::pair<std::function<XlaOp(XlaOp)>, string>>({
+         std::vector<std::pair<std::function<XlaOp(XlaOp)>, std::string>>({
              {IsFinite, "is_finite"},
              {IsInf, "is_inf"},
              {IsPosInf, "is_pos_inf"},
@@ -218,7 +241,11 @@ XLA_TEST_F(MathTest, RealFpOnlyOps) {
       XlaOp p = Parameter(&b, 0, shape, "p0");
       test.first(p);
 
-      EXPECT_EQ(b.first_error().ok(), primitive_util::IsFloatingPointType(ty));
+      if (primitive_util::IsFloatingPointType(ty)) {
+        TF_EXPECT_OK(b.first_error());
+      } else {
+        EXPECT_FALSE(b.first_error().ok());
+      }
     }
   }
 }
@@ -228,7 +255,7 @@ XLA_TEST_F(MathTest, SqrtF32) {
   Literal zero_literal = LiteralUtil::Zero(PrimitiveType::F32);
 
   std::unique_ptr<GlobalData> zero_data =
-      client_->TransferToServer(zero_literal).ConsumeValueOrDie();
+      client_->TransferToServer(zero_literal).value();
 
   XlaOp zero = Parameter(&builder, 0, zero_literal.shape(), "zero");
   Sqrt(zero);
@@ -241,7 +268,7 @@ XLA_TEST_F(MathTest, SqrtF64) {
   Literal zero_literal = LiteralUtil::Zero(PrimitiveType::F64);
 
   std::unique_ptr<GlobalData> zero_data =
-      client_->TransferToServer(zero_literal).ConsumeValueOrDie();
+      client_->TransferToServer(zero_literal).value();
 
   XlaOp zero = Parameter(&builder, 0, zero_literal.shape(), "zero");
   Sqrt(zero);
@@ -311,13 +338,22 @@ XLA_TEST_F(MathTest, SqrtSixValues) {
   ComputeAndCompareR1<float>(&builder, expected, {}, error_spec_);
 }
 
-XLA_TEST_F(MathTest, CbrtSixValues) {
+XLA_TEST_F(MathTest, CbrtSixF32Values) {
   XlaBuilder builder(TestName());
   auto x = ConstantR1<float>(&builder, {8.0, 1.0, 4096.0, -64.0, 1.728, 1331});
   Cbrt(x);
 
   std::vector<float> expected = {2, 1, 16, -4, 1.2, 11};
   ComputeAndCompareR1<float>(&builder, expected, {}, ErrorSpec(0.001));
+}
+
+XLA_TEST_F(MathTest, CbrtSixF64Values) {
+  XlaBuilder builder(TestName());
+  auto x = ConstantR1<double>(&builder, {8.0, 1.0, 4096.0, -64.0, 1.728, 1331});
+  Cbrt(x);
+
+  std::vector<double> expected = {2, 1, 16, -4, 1.2, 11};
+  ComputeAndCompareR1<double>(&builder, expected, {}, ErrorSpec(0.001));
 }
 
 XLA_TEST_F(MathTest, SinhSmallValues) {

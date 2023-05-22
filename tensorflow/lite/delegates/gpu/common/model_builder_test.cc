@@ -23,9 +23,13 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
+#include "absl/types/span.h"
 #include "tensorflow/lite/builtin_ops.h"
+#include "tensorflow/lite/core/c/common.h"
 #include "tensorflow/lite/core/subgraph.h"
 #include "tensorflow/lite/delegates/gpu/common/data_type.h"
 #include "tensorflow/lite/delegates/gpu/common/model_builder_internal.h"
@@ -150,7 +154,7 @@ class DelegatedInterpreter {
   // GetNodeAndRegistration.  We can't implement those using
   //   TfLiteContext *context = interpreter_.primary_subgraph().context();
   //   context->GetNodeAndRegistration(context, &node, &registration);
-  // here, because calling GetNodeAndRegistration from within it's own
+  // here, because calling GetNodeAndRegistration from within its own
   // implementation would lead to an infinite loop.
   // Instead, we just call node_and_registration and use a const_cast.
   // These const_casts are a bit ugly, but I think less ugly than exposing
@@ -753,12 +757,10 @@ TEST(ModelBuilderTest, GetOpsToReplaceMultiplePartitions) {
       context, /*allow_quant_ops=*/false, /*max_delegated_partitions*/ 2);
 
   // As the Dequant op is not pruned and the ADD op could run on GPU, we have
-  // 2 partitions.
-  EXPECT_EQ(ops_to_replace->size, 2);
-  // ADD at index 1.
-  EXPECT_EQ(1, ops_to_replace->data[0]);
-  // ADD at index 3.
-  EXPECT_EQ(3, ops_to_replace->data[1]);
+  // 2 partitions with an ADD each (op #1 and op #3).
+  ASSERT_EQ(ops_to_replace->size, 2);
+  EXPECT_THAT(absl::MakeConstSpan(ops_to_replace->data, 2),
+              testing::UnorderedElementsAre(1, 3));
 
   TfLiteIntArrayFree(ops_to_replace);
 }
@@ -1251,7 +1253,124 @@ TEST(ModelBuilderTest, GetOpsToReplace_AllowQuantOps) {
   TfLiteIntArrayFree(ops_to_replace_without_quant);
 }
 
-// StubTfLiteContext is a TfLiteContext which has 3 nodes as the followings.
+InterpreterFp16* interpreter_fp16_split_op =
+    new InterpreterFp16(kTfLiteBuiltinSplit);
+
+TEST(ModelBuilderTest, GetOpsToReplaceAcceptsSplitOpCl) {
+  // Before pruning, the graph has three nodes:
+  //
+  //   t0 (FP16) -> DequantNode -> t1 (FP32) -> Split -> t4
+  //   t2 (FP16) -> DequantNode -> t3 (FP32) --/
+  //
+  // OpsToReplace should choose all three nodes for replacement, and
+  // the graph on the GPU will look like this (no Dequants):
+  //
+  //   t0 (FP16) --> Split -> t4
+  //   t2 (FP16) --/
+  //
+  TfLiteContext* context = interpreter_fp16_split_op->context();
+
+  // These functions are meant to be called inside delegates. Swap out
+  // for similar functions to permit direct calling of GetOpsToReplace.
+  context->GetExecutionPlan = [](struct TfLiteContext* context,
+                                 TfLiteIntArray** execution_plan) {
+    *execution_plan = interpreter_fp16_split_op->exec_plan();
+    return kTfLiteOk;
+  };
+  context->GetNodeAndRegistration = [](struct TfLiteContext*, int node_index,
+                                       TfLiteNode** node,
+                                       TfLiteRegistration** registration) {
+    *node = interpreter_fp16_split_op->node(node_index);
+    *registration = interpreter_fp16_split_op->registration(node_index);
+    return kTfLiteOk;
+  };
+  context->PreviewDelegatePartitioning =
+      [](struct TfLiteContext* context, const TfLiteIntArray* nodes_to_replace,
+         TfLiteDelegateParams** partition_params_array, int* num_partitions) {
+        // The partitioner should accept only the Add op initially.
+        EXPECT_EQ(nodes_to_replace->size, 1);
+        // Single partition output.
+        auto params = interpreter_fp16_split_op->add_delegate_params();
+        params->nodes_to_replace = TfLiteIntArrayCreate(1);
+        params->nodes_to_replace->data[0] = 2;
+        params->input_tensors = TfLiteIntArrayCreate(2);
+        params->input_tensors->data[0] = 1;
+        params->input_tensors->data[1] = 3;
+        params->output_tensors = TfLiteIntArrayCreate(1);
+        params->output_tensors->data[0] = 4;
+
+        *partition_params_array = interpreter_fp16_split_op->delegate_params();
+        *num_partitions = interpreter_fp16_split_op->num_delegate_params();
+        return kTfLiteOk;
+      };
+
+  TfLiteIntArray* ops_to_replace = GetOpsToReplace(context);
+
+  // Ensure all nodes are delegated, and the SPLIT op has FP16 inputs.
+  EXPECT_EQ(ops_to_replace->size, 3);
+  TfLiteNode* node = nullptr;
+  TfLiteRegistration* registration = nullptr;
+  context->GetNodeAndRegistration(context, /**node_id**/ 2, &node,
+                                  &registration);
+  EXPECT_EQ(context->tensors[node->inputs->data[0]].type,
+            TfLiteType::kTfLiteFloat16);
+  EXPECT_EQ(context->tensors[node->inputs->data[1]].type,
+            TfLiteType::kTfLiteFloat16);
+  TfLiteIntArrayFree(ops_to_replace);
+}
+
+InterpreterFp16* interpreter_fp16_split_op2 =
+    new InterpreterFp16(kTfLiteBuiltinSplit);
+TEST(ModelBuilderTest, GetOpsToReplaceRejectsSplitOpGl) {
+  // Same graph as that in the test case `GetOpsToReplaceAcceptsSplitOpCl`,
+  // while OpenCL is not available when calling GetOpsToReplace.
+  // OpenGL does not support SPLIT op, so we don't choose any nodes.
+
+  TfLiteContext* context = interpreter_fp16_split_op2->context();
+  // These functions are meant to be called inside delegates. Swap out
+  // for similar functions to permit direct calling of GetOpsToReplace.
+  context->GetExecutionPlan = [](struct TfLiteContext* context,
+                                 TfLiteIntArray** execution_plan) {
+    *execution_plan = interpreter_fp16_split_op2->exec_plan();
+    return kTfLiteOk;
+  };
+  context->GetNodeAndRegistration = [](struct TfLiteContext*, int node_index,
+                                       TfLiteNode** node,
+                                       TfLiteRegistration** registration) {
+    *node = interpreter_fp16_split_op2->node(node_index);
+    *registration = interpreter_fp16_split_op2->registration(node_index);
+    return kTfLiteOk;
+  };
+  context->PreviewDelegatePartitioning =
+      [](struct TfLiteContext* context, const TfLiteIntArray* nodes_to_replace,
+         TfLiteDelegateParams** partition_params_array, int* num_partitions) {
+        // No selected nodes.
+        EXPECT_EQ(nodes_to_replace->size, 0);
+        *partition_params_array = nullptr;
+        *num_partitions = 0;
+        return kTfLiteOk;
+      };
+  absl::flat_hash_set<TfLiteBuiltinOperator> excluded_ops = {
+      kTfLiteBuiltinSplit};
+  TfLiteIntArray* ops_to_replace =
+      GetOpsToReplace(context, /*allow_quant_ops=*/false,
+                      /*max_delegated_partitions=*/1, &excluded_ops);
+
+  // No nodes were found to replace.
+  EXPECT_EQ(ops_to_replace->size, 0);
+  // Inputs to Split op are still fp32.
+  TfLiteNode* node = nullptr;
+  TfLiteRegistration* registration = nullptr;
+  context->GetNodeAndRegistration(context, /**node_id**/ 2, &node,
+                                  &registration);
+  EXPECT_EQ(context->tensors[node->inputs->data[0]].type,
+            TfLiteType::kTfLiteFloat32);
+  EXPECT_EQ(context->tensors[node->inputs->data[1]].type,
+            TfLiteType::kTfLiteFloat32);
+  TfLiteIntArrayFree(ops_to_replace);
+}
+
+// StubTfLiteContext is a TfLiteContext which has 3 nodes as the following.
 // dummyAdd -> target op -> dummyAdd
 class StubTfLiteContext : public TfLiteContext {
  public:
@@ -1413,13 +1532,39 @@ TEST(CastOperationParserTest, TestIsSupported) {
   context = std::make_unique<StubTfLiteContext>(kTfLiteBuiltinCast,
                                                 /*op_version=*/1,
                                                 /*num_inputs=*/1);
-  context->tensor(1)->type = kTfLiteBool;
+
+  context->tensor(1)->type = kTfLiteFloat32;
+  context->tensor(2)->type = kTfLiteInt32;
+  EXPECT_TRUE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+
+  context->tensor(1)->type = kTfLiteInt32;
+  context->tensor(2)->type = kTfLiteFloat32;
+  EXPECT_TRUE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+
+  context->tensor(1)->type = kTfLiteInt8;
+  context->tensor(2)->type = kTfLiteFloat32;
   EXPECT_FALSE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+
+  context->tensor(1)->type = kTfLiteBool;
+  EXPECT_TRUE(
       parser
           ->IsSupported(context.get(), context->node(), context->registration())
           .ok());
   // Valid
   context->registration(0)->builtin_code = kTfLiteBuiltinGreater;
+  EXPECT_TRUE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
   EXPECT_TRUE(
       parser
           ->IsSupported(context.get(), context->node(), context->registration())
@@ -1693,6 +1838,16 @@ TEST(LogicalElementwiseOperationParserTest, TestIsSupported) {
       parser
           ->IsSupported(context.get(), context->node(), context->registration())
           .ok());
+  context->registration(2)->builtin_code = kTfLiteBuiltinSelect;
+  EXPECT_TRUE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+  context->registration(2)->builtin_code = kTfLiteBuiltinSelectV2;
+  EXPECT_TRUE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
 }
 
 TEST(ArithmeticUnaryElementwiseOperationParserTest, TestIsSupported) {
@@ -1776,6 +1931,80 @@ TEST(FullyConnectedOperationParserTest, TestIsSupported) {
   // Invalid keep_num_dims
   context->tensor(1)->dims->size = 3;
   EXPECT_FALSE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+}
+
+TEST(GatherOperationParserTest, TestIsSupported) {
+  // Invalid num_inputs
+  auto context = std::make_unique<StubTfLiteContext>(kTfLiteBuiltinGather,
+                                                     /*op_version=*/1,
+                                                     /*num_inputs=*/1);
+  auto parser = NewOperationParser(context->registration());
+  EXPECT_FALSE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+  // Invalid num inputs
+  context = std::make_unique<StubTfLiteContext>(kTfLiteBuiltinGather,
+                                                /*op_version=*/1,
+                                                /*num_inputs=*/3);
+  context->tensor(2)->dims->size = 1;
+  context->tensor(2)->type = kTfLiteInt32;
+  EXPECT_FALSE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+  // Can't have int32 input
+  context = std::make_unique<StubTfLiteContext>(kTfLiteBuiltinGather,
+                                                /*op_version=*/1,
+                                                /*num_inputs=*/2);
+  context->tensor(1)->type = kTfLiteInt32;
+  context->tensor(2)->dims->size = 1;
+  context->tensor(2)->type = kTfLiteInt32;
+  EXPECT_FALSE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+  // Need 1D indices
+  context = std::make_unique<StubTfLiteContext>(kTfLiteBuiltinGather,
+                                                /*op_version=*/1,
+                                                /*num_inputs=*/2);
+  context->tensor(2)->dims->size = 2;
+  context->tensor(2)->type = kTfLiteInt32;
+  EXPECT_FALSE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+  // Need int32 indices
+  context = std::make_unique<StubTfLiteContext>(kTfLiteBuiltinGather,
+                                                /*op_version=*/1,
+                                                /*num_inputs=*/2);
+  context->tensor(2)->dims->size = 1;
+  context->tensor(2)->type = kTfLiteFloat32;
+  EXPECT_FALSE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+  // VALID
+  context = std::make_unique<StubTfLiteContext>(kTfLiteBuiltinGather,
+                                                /*op_version=*/1,
+                                                /*num_inputs=*/2);
+  context->tensor(2)->dims->size = 1;
+  context->tensor(2)->type = kTfLiteInt32;
+  EXPECT_TRUE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+  // VALID with runtime indices
+  context = std::make_unique<StubTfLiteContext>(kTfLiteBuiltinGather,
+                                                /*op_version=*/1,
+                                                /*num_inputs=*/2);
+  context->tensor(2)->dims->size = 1;
+  context->tensor(2)->type = kTfLiteInt32;
+  context->tensor(2)->allocation_type = kTfLiteMmapRo;
+  EXPECT_TRUE(
       parser
           ->IsSupported(context.get(), context->node(), context->registration())
           .ok());
@@ -2631,7 +2860,7 @@ TEST(SplitVOperationParserTest, TestIsSupported) {
 TEST(StridedSliceOperationParserTest, TestIsSupported) {
   // Invalid op_version
   auto context = std::make_unique<StubTfLiteContext>(kTfLiteBuiltinStridedSlice,
-                                                     /*op_version=*/3,
+                                                     /*op_version=*/5,
                                                      /*num_inputs=*/4);
   auto parser = NewOperationParser(context->registration());
   EXPECT_FALSE(
@@ -2640,7 +2869,7 @@ TEST(StridedSliceOperationParserTest, TestIsSupported) {
           .ok());
   // Invalid num_inputs
   context = std::make_unique<StubTfLiteContext>(kTfLiteBuiltinStridedSlice,
-                                                /*op_version=*/2,
+                                                /*op_version=*/4,
                                                 /*num_inputs=*/3);
   EXPECT_FALSE(
       parser
@@ -2648,7 +2877,7 @@ TEST(StridedSliceOperationParserTest, TestIsSupported) {
           .ok());
   // Invalid input dimenstion 2d
   context = std::make_unique<StubTfLiteContext>(kTfLiteBuiltinStridedSlice,
-                                                /*op_version=*/2,
+                                                /*op_version=*/4,
                                                 /*num_inputs=*/4);
   context->tensor(1)->dims->size = 2;
   EXPECT_FALSE(
@@ -2657,7 +2886,7 @@ TEST(StridedSliceOperationParserTest, TestIsSupported) {
           .ok());
   // Valid
   context = std::make_unique<StubTfLiteContext>(kTfLiteBuiltinStridedSlice,
-                                                /*op_version=*/2,
+                                                /*op_version=*/4,
                                                 /*num_inputs=*/5);
   EXPECT_TRUE(
       parser
@@ -2772,7 +3001,7 @@ TEST(TransposeConvCustomOperationParserTest, TestIsSupported) {
 TEST(TransposeOperationParserTest, TestIsSupported) {
   // Invalid op_version
   auto context = std::make_unique<StubTfLiteContext>(kTfLiteBuiltinTranspose,
-                                                     /*op_version=*/3,
+                                                     /*op_version=*/5,
                                                      /*num_inputs=*/1);
   auto parser = NewOperationParser(context->registration());
   EXPECT_FALSE(
@@ -2781,7 +3010,7 @@ TEST(TransposeOperationParserTest, TestIsSupported) {
           .ok());
   // Invalid num_inputs
   context = std::make_unique<StubTfLiteContext>(kTfLiteBuiltinTranspose,
-                                                /*op_version=*/2,
+                                                /*op_version=*/4,
                                                 /*num_inputs=*/2);
   EXPECT_FALSE(
       parser
@@ -2790,7 +3019,7 @@ TEST(TransposeOperationParserTest, TestIsSupported) {
 
   // IValid
   context = std::make_unique<StubTfLiteContext>(kTfLiteBuiltinTranspose,
-                                                /*op_version=*/2,
+                                                /*op_version=*/4,
                                                 /*num_inputs=*/1);
   EXPECT_TRUE(
       parser
@@ -2901,6 +3130,169 @@ TEST(MeanOperationParserTest, TestIsSupported) {
                                                 /*num_inputs=*/2);
   context->tensor(2)->allocation_type = kTfLiteMmapRo;  // Treat axis as const
   context->tensor(2)->type = kTfLiteInt32;
+  EXPECT_TRUE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+}
+
+TEST(CumsumOperationParserTest, TestIsSupported) {
+  // Invalid num_inputs
+  auto context = std::make_unique<StubTfLiteContext>(kTfLiteBuiltinCumsum,
+                                                     /*op_version=*/1,
+                                                     /*num_inputs=*/3);
+  context->tensor(2)->type = kTfLiteFloat32;
+  auto parser = NewOperationParser(context->registration());
+  EXPECT_FALSE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+  context = std::make_unique<StubTfLiteContext>(kTfLiteBuiltinCumsum,
+                                                /*op_version=*/1,
+                                                /*num_inputs=*/2);
+  // bad axes
+  context->tensor(2)->type = kTfLiteFloat32;
+  EXPECT_FALSE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+
+  // bad input
+  context->tensor(1)->type = kTfLiteInt32;
+  context->tensor(2)->type = kTfLiteInt32;
+  EXPECT_FALSE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+
+  context->tensor(1)->type = kTfLiteFloat32;
+  context->tensor(2)->type = kTfLiteInt32;
+  context->tensor(2)->allocation_type = kTfLiteMmapRo;
+  EXPECT_TRUE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+}
+
+TEST(OneHotOperationParserTest, TestIsSupported) {
+  // Invalid num_inputs
+  auto context = std::make_unique<StubTfLiteContext>(kTfLiteBuiltinOneHot,
+                                                     /*op_version=*/1,
+                                                     /*num_inputs=*/4);
+  auto parser = NewOperationParser(context->registration());
+  auto status = parser->IsSupported(context.get(), context->node(),
+                                    context->registration());
+
+  context->tensor(1)->dims->data[1] = 2;
+  context->tensor(1)->dims->data[2] = 2;
+  EXPECT_FALSE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+  context->tensor(1)->type = kTfLiteInt32;
+  EXPECT_FALSE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+
+  auto* params =
+      reinterpret_cast<TfLiteOneHotParams*>(malloc(sizeof(TfLiteOneHotParams)));
+  params->axis = -1;
+  if (context->node(1)->builtin_data) {
+    free(context->node(1)->builtin_data);
+  }
+  context->node(1)->builtin_data = params;
+  EXPECT_FALSE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+  context->tensor(1)->dims->data[1] = 1;
+  context->tensor(1)->dims->data[2] = 1;
+  EXPECT_FALSE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+
+  TfLiteIntArrayFree(context->tensor(3)->dims);
+  context->tensor(3)->dims = TfLiteIntArrayCreate(1);
+  context->tensor(3)->dims->data[0] = 1;
+  context->tensor(3)->allocation_type = kTfLiteMmapRo;
+  TfLiteIntArrayFree(context->tensor(4)->dims);
+  context->tensor(4)->dims = TfLiteIntArrayCreate(1);
+  context->tensor(4)->dims->data[0] = 1;
+  context->tensor(4)->allocation_type = kTfLiteMmapRo;
+  params->axis =
+      context->tensor(1)->dims->data[context->tensor(1)->dims->size - 1];
+  context->node(1)->builtin_data = params;
+
+  EXPECT_TRUE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+
+  context->tensor(1)->dims->data[0] = 2;
+  EXPECT_TRUE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+}
+
+TEST(SelectV2OperationParserTest, TestIsSupported) {
+  // Invalid num_inputs
+  auto context = std::make_unique<StubTfLiteContext>(kTfLiteBuiltinSelectV2,
+                                                     /*op_version=*/1,
+                                                     /*num_inputs=*/3);
+  auto parser = NewOperationParser(context->registration());
+  auto status = parser->IsSupported(context.get(), context->node(),
+                                    context->registration());
+  // Input is (1, 2, 1, 4)
+  context->tensor(1)->dims->data[0] = 1;
+  context->tensor(1)->dims->data[1] = 2;
+  context->tensor(1)->dims->data[2] = 1;
+  context->tensor(1)->dims->data[3] = 4;
+
+  // Input is (1, 2, 3, 4)
+  context->tensor(4)->dims->data[0] = 1;
+  context->tensor(4)->dims->data[1] = 2;
+  context->tensor(4)->dims->data[2] = 3;
+  context->tensor(4)->dims->data[3] = 4;
+  context->tensor(1)->type = kTfLiteInt32;
+  context->tensor(2)->type = kTfLiteInt32;
+  context->tensor(3)->type = kTfLiteInt32;
+  EXPECT_FALSE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+
+  context->tensor(1)->type = kTfLiteFloat32;
+  EXPECT_FALSE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+
+  context->tensor(2)->type = kTfLiteFloat32;
+  EXPECT_FALSE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+
+  context->tensor(3)->type = kTfLiteFloat32;
+  EXPECT_FALSE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+
+  TfLiteIntArrayFree(context->tensor(2)->dims);
+  context->tensor(2)->dims = TfLiteIntArrayCreate(1);
+  context->tensor(2)->dims->data[0] = 1;
+  EXPECT_FALSE(
+      parser
+          ->IsSupported(context.get(), context->node(), context->registration())
+          .ok());
+
+  for (int i = 0; i < context->tensor(4)->dims->size; ++i) {
+    context->tensor(3)->dims->data[i] = context->tensor(4)->dims->data[i];
+  }
   EXPECT_TRUE(
       parser
           ->IsSupported(context.get(), context->node(), context->registration())

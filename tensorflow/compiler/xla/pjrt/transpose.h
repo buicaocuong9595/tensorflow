@@ -88,7 +88,7 @@ class TransposePlan {
   static StatusOr<std::unique_ptr<TransposePlan>> Create(
       size_t elem_size_in_bytes, absl::Span<int64_t const> dims,
       absl::Span<int64_t const> permutation,
-      absl::variant<Tiling, Striding> input_layout = Tiling{},
+      std::variant<Tiling, Striding> input_layout = Tiling{},
       Tiling output_tiling = Tiling{},
       Transformation transformation = Transformation::kNone,
       int num_threads = 1);
@@ -240,7 +240,21 @@ class TransposePlan {
   int64_t scratch_size_ = 0;
 };
 
-struct TransposePlanCacheKey;
+struct TransposePlanCacheKey {
+  template <typename H>
+  friend H AbslHashValue(H h, const TransposePlanCacheKey& key);
+
+  size_t elem_size_in_bytes;
+  absl::InlinedVector<int64_t, 4> dims;
+  absl::InlinedVector<int64_t, 4> permutation;
+  bool input_layout_is_tiling;
+  absl::InlinedVector<int64_t, 4> input_layout;
+  absl::InlinedVector<int64_t, 4> output_tiling;
+  TransposePlan::Transformation transformation;
+  int num_threads;
+
+  bool operator==(const TransposePlanCacheKey& other) const;
+};
 
 template <typename H>
 H AbslHashValue(H h, const TransposePlanCacheKey& key);
@@ -263,7 +277,7 @@ class TransposePlanCache {
   StatusOr<std::shared_ptr<TransposePlan>> GetOrCreate(
       size_t elem_size_in_bytes, absl::Span<int64_t const> dims,
       absl::Span<int64_t const> permutation,
-      absl::variant<TransposePlan::Tiling, TransposePlan::Striding>
+      std::variant<TransposePlan::Tiling, TransposePlan::Striding>
           input_layout = TransposePlan::Tiling{},
       TransposePlan::Tiling output_tiling = TransposePlan::Tiling{},
       TransposePlan::Transformation transformation =

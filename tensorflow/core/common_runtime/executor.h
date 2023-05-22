@@ -16,6 +16,8 @@ limitations under the License.
 #ifndef TENSORFLOW_CORE_COMMON_RUNTIME_EXECUTOR_H_
 #define TENSORFLOW_CORE_COMMON_RUNTIME_EXECUTOR_H_
 
+#include <optional>
+
 #include "absl/time/time.h"
 #include "absl/types/optional.h"
 #include "tensorflow/core/common_runtime/device.h"
@@ -30,6 +32,7 @@ limitations under the License.
 #include "tensorflow/core/lib/core/threadpool_interface.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/macros.h"
+#include "tensorflow/core/util/managed_stack_trace.h"
 
 namespace tensorflow {
 
@@ -90,6 +93,9 @@ class Executor {
   // execution. Used for system-wide latency metrics.
   struct Args {
     int64_t step_id = 0;
+    // Used only by tracer/profiler, applicable only when running under
+    // FunctionRuntimeLibrary, unique per invocation.
+    std::optional<int64_t> function_trace_id;
     RendezvousInterface* rendezvous = nullptr;
     StepStatsCollectorInterface* stats_collector = nullptr;
     CallFrameInterface* call_frame = nullptr;
@@ -101,10 +107,11 @@ class Executor {
     ScopedStepContainer* step_container = nullptr;
     CollectiveExecutor* collective_executor = nullptr;
     thread::ThreadPoolInterface* user_intra_op_threadpool = nullptr;
-    CoordinationServiceAgent* coordination_service_agent = nullptr;
+    tsl::CoordinationServiceAgent* coordination_service_agent = nullptr;
     int64_t start_time_usecs = 0;
     // The deadline for the kernel to complete by. Empty if unspecified.
     absl::optional<absl::Time> deadline;
+    absl::optional<ManagedStackTrace> stack_trace = absl::nullopt;
 
     // If true, calls Sync() on the device.
     bool sync_on_finish = false;

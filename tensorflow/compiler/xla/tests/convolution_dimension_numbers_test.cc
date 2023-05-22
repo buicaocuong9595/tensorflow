@@ -17,7 +17,6 @@ limitations under the License.
 #include <array>
 #include <memory>
 
-#include "absl/memory/memory.h"
 #include "tensorflow/compiler/xla/array4d.h"
 #include "tensorflow/compiler/xla/client/local_client.h"
 #include "tensorflow/compiler/xla/client/padding.h"
@@ -28,8 +27,6 @@ limitations under the License.
 #include "tensorflow/compiler/xla/tests/client_library_test_base.h"
 #include "tensorflow/compiler/xla/tests/literal_test_util.h"
 #include "tensorflow/compiler/xla/tests/test_macros.h"
-#include "tensorflow/core/platform/logging.h"
-#include "tensorflow/core/platform/types.h"
 
 namespace xla {
 namespace {
@@ -64,7 +61,7 @@ TEST_F(ConvolutionDimensionNumbersTest, InvalidInputDimensionNumbers) {
   auto dimension_numbers_status =
       CreateConvDimensionNumbers(0, 2, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3);
   ASSERT_FALSE(dimension_numbers_status.ok());
-  ASSERT_THAT(dimension_numbers_status.status().error_message(),
+  ASSERT_THAT(dimension_numbers_status.status().message(),
               ::testing::HasSubstr("input are not unique"));
 }
 
@@ -73,7 +70,7 @@ TEST_F(ConvolutionDimensionNumbersTest, InvalidWeightDimensionNumbers) {
   auto dimension_numbers_status =
       CreateConvDimensionNumbers(0, 1, 2, 3, 0, 1, 2, 3, 0, 2, 2, 3);
   ASSERT_FALSE(dimension_numbers_status.ok());
-  ASSERT_THAT(dimension_numbers_status.status().error_message(),
+  ASSERT_THAT(dimension_numbers_status.status().message(),
               ::testing::HasSubstr("weight are not unique"));
 }
 
@@ -82,19 +79,19 @@ TEST_F(ConvolutionDimensionNumbersTest, InvalidOutputDimensionNumbers) {
   auto dimension_numbers_status =
       CreateConvDimensionNumbers(0, 1, 2, 3, 0, 2, 2, 3, 0, 1, 2, 3);
   ASSERT_FALSE(dimension_numbers_status.ok());
-  ASSERT_THAT(dimension_numbers_status.status().error_message(),
+  ASSERT_THAT(dimension_numbers_status.status().message(),
               ::testing::HasSubstr("output are not unique"));
 }
 
 XLA_TEST_F(ConvolutionDimensionNumbersTest,
            TwoConvsWithDifferentDimensionNumbers) {
-  auto input_array = absl::make_unique<Array4D<float>>(2, 3, 5, 5);
+  auto input_array = std::make_unique<Array4D<float>>(2, 3, 5, 5);
   input_array->FillWithMultiples(0.1);
-  auto weight_array = absl::make_unique<Array4D<float>>(4, 3, 1, 1);
+  auto weight_array = std::make_unique<Array4D<float>>(4, 3, 1, 1);
   weight_array->FillWithMultiples(0.2);
   auto weight_data =
       client_->TransferToServer(LiteralUtil::CreateR4FromArray4D(*weight_array))
-          .ConsumeValueOrDie();
+          .value();
 
   XlaBuilder builder(TestName());
   auto input = ConstantR4FromArray4D<float>(&builder, *input_array);

@@ -53,7 +53,7 @@ struct PoolParameters {
                  TensorFormat data_format, const TensorShape& tensor_in_shape);
 
   // Returns the shape of the output for "forward" pooling operations.
-  TensorShape forward_output_shape();
+  Status forward_output_shape(TensorShape* shape);
 
   int depth;
 
@@ -82,11 +82,6 @@ struct PoolParameters {
 
   TensorFormat data_format;
 };
-
-// Checks if the sizes of the paddings are less than the size of window.
-// This is required for MaxPool because it pads with -inf, so the pooling
-// window cannot fully cover the padded area.
-Status CheckPaddingSize(PoolParameters& params);
 
 // An implementation of MaxPooling (forward).
 // TODO (yongtang): Remove MaxPoolingOp and use MaxPoolingV2Op,
@@ -141,8 +136,11 @@ class MaxPoolingOp : public OpKernel {
     }
 
     Tensor* output = nullptr;
+    TensorShape params_forward_output_shape;
+    OP_REQUIRES_OK(context,
+                   params.forward_output_shape(&params_forward_output_shape));
     OP_REQUIRES_OK(context, context->allocate_output(
-                                0, params.forward_output_shape(), &output));
+                                0, params_forward_output_shape, &output));
 
     if (params.depth_window > 1) {
       // Validate spec against the current implementation.  A
@@ -194,6 +192,9 @@ class MaxPoolingOp : public OpKernel {
   void SpatialMaxPool(OpKernelContext* context, Tensor* output,
                       const Tensor& tensor_in, const PoolParameters& params,
                       const Padding& padding) {
+    if (output->NumElements() == 0) {
+      return;
+    }
     // On GPU, use Eigen's Spatial Max Pooling.  On CPU, use an
     // EigenMatrix version that is currently faster than Eigen's
     // Spatial MaxPooling implementation.
@@ -354,6 +355,10 @@ class MaxPoolingV2Op : public OpKernel {
       OP_REQUIRES(context, ksize_.size() == 4,
                   errors::InvalidArgument("Sliding window ksize field must "
                                           "specify 4 dimensions"));
+      OP_REQUIRES(
+          context,
+          ksize_[0] > 0 && ksize_[1] > 0 && ksize_[2] > 0 && ksize_[3] > 0,
+          errors::InvalidArgument("Sliding window ksize must be positive."));
       OP_REQUIRES_OK(context, context->GetAttr("strides", &stride_));
       OP_REQUIRES(context, stride_.size() == 4,
                   errors::InvalidArgument("Sliding window stride field must "
@@ -386,6 +391,9 @@ class MaxPoolingV2Op : public OpKernel {
     OP_REQUIRES(context, ksize.size() == 4,
                 errors::InvalidArgument("Sliding window ksize field must "
                                         "specify 4 dimensions"));
+    OP_REQUIRES(
+        context, ksize[0] > 0 && ksize[1] > 0 && ksize[2] > 0 && ksize[3] > 0,
+        errors::InvalidArgument("Sliding window ksize must be positive."));
     OP_REQUIRES(context, stride.size() == 4,
                 errors::InvalidArgument("Sliding window stride field must "
                                         "specify 4 dimensions"));
@@ -407,8 +415,11 @@ class MaxPoolingV2Op : public OpKernel {
     }
 
     Tensor* output = nullptr;
+    TensorShape params_forward_output_shape;
+    OP_REQUIRES_OK(context,
+                   params.forward_output_shape(&params_forward_output_shape));
     OP_REQUIRES_OK(context, context->allocate_output(
-                                0, params.forward_output_shape(), &output));
+                                0, params_forward_output_shape, &output));
 
     if (params.depth_window > 1) {
       // Validate spec against the current implementation.  A
@@ -448,6 +459,9 @@ class MaxPoolingV2Op : public OpKernel {
   void SpatialMaxPool(OpKernelContext* context, Tensor* output,
                       const Tensor& tensor_in, const PoolParameters& params,
                       const Padding& padding) {
+    if (output->NumElements() == 0) {
+      return;
+    }
     // On GPU, use Eigen's Spatial Max Pooling.  On CPU, use an
     // EigenMatrix version that is currently faster than Eigen's
     // Spatial MaxPooling implementation.
@@ -566,6 +580,9 @@ template <typename Device, typename T>
 void SpatialAvgPool(OpKernelContext* context, Tensor* output,
                     const Tensor& input, const PoolParameters& params,
                     const Padding& padding) {
+  if (output->NumElements() == 0) {
+    return;
+  }
   typedef Eigen::Map<const Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>>
       ConstEigenMatrixMap;
   typedef Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>>

@@ -19,8 +19,6 @@ import operator
 import sys
 from absl.testing import parameterized
 import numpy as np
-from six.moves import range
-from six.moves import zip
 
 from tensorflow.python.eager import context
 from tensorflow.python.eager import def_function
@@ -1158,6 +1156,14 @@ class ArrayMethodsTest(test.TestCase):
     x = np_array_ops.arange(8)
     y = np_array_ops.split(x, [3, 5, 6, 10])
     self.assertListEqual([([0, 1, 2]), ([3, 4]), ([5]), ([6, 7]), ([])], y)
+
+  def testHSplitBecomesVsplitFor1DInput(self):
+    @def_function.function
+    def f(arr):
+      return np_array_ops.hsplit(arr, 2)
+
+    x = np_array_ops.arange(4)
+    self.assertListEqual([[0, 1], [2, 3]], f(x))
 
   def testSign(self):
     state = np.random.RandomState(0)

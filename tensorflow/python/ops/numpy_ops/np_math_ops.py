@@ -19,21 +19,22 @@ import numbers
 import sys
 
 import numpy as np
-import six
 
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import errors
 from tensorflow.python.framework import ops
 from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import array_ops_stack
 from tensorflow.python.ops import bitwise_ops
 from tensorflow.python.ops import clip_ops
-from tensorflow.python.ops import control_flow_ops
+from tensorflow.python.ops import control_flow_assert
 from tensorflow.python.ops import gen_math_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import nn_ops
 from tensorflow.python.ops import sort_ops
 from tensorflow.python.ops import special_math_ops
+from tensorflow.python.ops import while_loop
 from tensorflow.python.ops.numpy_ops import np_array_ops
 from tensorflow.python.ops.numpy_ops import np_arrays
 from tensorflow.python.ops.numpy_ops import np_dtypes
@@ -226,7 +227,7 @@ def matmul(x1, x2):  # pylint: disable=missing-docstring
                   x1, x2, axes=[[0], [-2]]),
               lambda: math_ops.matmul(x1, x2)))
     except errors.InvalidArgumentError as err:
-      six.reraise(ValueError, ValueError(str(err)), sys.exc_info()[2])
+      raise ValueError(str(err)).with_traceback(sys.exc_info()[2])
 
   return _bin_op(f, x1, x2)
 
@@ -386,14 +387,14 @@ def kron(a, b):  # pylint: disable=missing-function-docstring
   # pylint: disable=protected-access,g-complex-comprehension
   a, b = np_array_ops._promote_dtype(a, b)
   t_a = np_utils.cond(
-      a.ndim < b.ndim,
+      a.shape.rank < b.shape.rank,
       lambda: np_array_ops.reshape(  # pylint: disable=g-long-lambda
-          a, np_array_ops._pad_left_to(b.ndim, a.shape)),
+          a, np_array_ops._pad_left_to(b.shape.rank, a.shape)),
       lambda: a)
   t_b = np_utils.cond(
-      b.ndim < a.ndim,
+      b.shape.rank < a.shape.rank,
       lambda: np_array_ops.reshape(  # pylint: disable=g-long-lambda
-          b, np_array_ops._pad_left_to(a.ndim, b.shape)),
+          b, np_array_ops._pad_left_to(a.shape.rank, b.shape)),
       lambda: b)
 
   def _make_shape(shape, prepend):
@@ -402,7 +403,7 @@ def kron(a, b):  # pylint: disable=missing-function-docstring
       shapes = [ones, shape]
     else:
       shapes = [shape, ones]
-    return array_ops.reshape(array_ops.stack(shapes, axis=1), [-1])
+    return array_ops.reshape(array_ops_stack.stack(shapes, axis=1), [-1])
 
   a_shape = array_ops.shape(t_a)
   b_shape = array_ops.shape(t_b)
@@ -448,7 +449,7 @@ def polyval(p, x):  # pylint: disable=missing-function-docstring
   def f(p, x):
     if p.shape.rank == 0:
       p = array_ops.reshape(p, [1])
-    p = array_ops.unstack(p)
+    p = array_ops_stack.unstack(p)
     # TODO(wangpeng): Make tf version take a tensor for p instead of a list.
     y = math_ops.polyval(p, x)
     # If the polynomial is 0-order, numpy requires the result to be broadcast to
@@ -507,8 +508,8 @@ def _tf_gcd(x1, x2):  # pylint: disable=missing-function-docstring
       array_ops.shape(x1), array_ops.shape(x2))
   x1 = array_ops.broadcast_to(x1, shape)
   x2 = array_ops.broadcast_to(x2, shape)
-  value, _ = control_flow_ops.while_loop(_gcd_cond_fn, _gcd_body_fn,
-                                         (math_ops.abs(x1), math_ops.abs(x2)))
+  value, _ = while_loop.while_loop(_gcd_cond_fn, _gcd_body_fn,
+                                   (math_ops.abs(x1), math_ops.abs(x2)))
   return value
 
 
@@ -527,9 +528,11 @@ def lcm(x1, x2):  # pylint: disable=missing-function-docstring
     # Same as the `x2_safe` trick above
     d_safe = array_ops.where_v2(
         math_ops.equal(d, 0), constant_op.constant(1, d.dtype), d)
+    x1 = math_ops.abs(x1)
+    x2 = math_ops.abs(x2)
     return array_ops.where_v2(
         math_ops.equal(d, 0), constant_op.constant(0, d.dtype),
-        math_ops.abs(x1 * x2) // d_safe)
+        x1 * (x2 // d_safe))
 
   return _bin_op(f, x1, x2)
 
@@ -1081,6 +1084,9 @@ def linspace(  # pylint: disable=missing-docstring
     else:
       result = math_ops.linspace(start, stop, num, axis=axis)
   if dtype:
+    if dtype.is_integer:
+      # Since numpy 1.20, linspace's rounding is towards -inf instead of 0
+      result = math_ops.floor(result)
     result = math_ops.cast(result, dtype)
   if retstep:
     return (result, step)
@@ -1144,7 +1150,7 @@ def concatenate(arys, axis=0):
 @np_utils.np_doc_only('tile')
 def tile(a, reps):  # pylint: disable=missing-function-docstring
   a = np_array_ops.array(a)
-  reps = np_array_ops.array(reps, dtype=dtypes.int32).reshape([-1])
+  reps = array_ops.reshape(np_array_ops.array(reps, dtype=dtypes.int32), [-1])
 
   a_rank = array_ops.rank(a)
   reps_size = array_ops.size(reps)
@@ -1239,7 +1245,7 @@ def append(arr, values, axis=None):
 
 @np_utils.np_doc('average')
 def average(a, axis=None, weights=None, returned=False):  # pylint: disable=missing-docstring
-  if axis is not None and not isinstance(axis, six.integer_types):
+  if axis is not None and not isinstance(axis, int):
     # TODO(wangpeng): Support tuple of ints as `axis`
     raise ValueError('Argument `axis` must be an integer. '
                      f'Received axis={axis} (of type {type(axis)})')
@@ -1265,7 +1271,7 @@ def average(a, axis=None, weights=None, returned=False):  # pylint: disable=miss
     weights = np_array_ops.array(weights, out_dtype)
 
     def rank_equal_case():
-      control_flow_ops.Assert(
+      control_flow_assert.Assert(
           math_ops.reduce_all(array_ops.shape(a) == array_ops.shape(weights)),
           [array_ops.shape(a), array_ops.shape(weights)])
       weights_sum = math_ops.reduce_sum(weights, axis=axis)
@@ -1277,7 +1283,7 @@ def average(a, axis=None, weights=None, returned=False):  # pylint: disable=miss
     else:
 
       def rank_not_equal_case():
-        control_flow_ops.Assert(
+        control_flow_assert.Assert(
             array_ops.rank(weights) == 1, [array_ops.rank(weights)])
         weights_sum = math_ops.reduce_sum(weights)
         axes = ops.convert_to_tensor([[axis], [0]])
@@ -1422,6 +1428,7 @@ def enable_numpy_methods_on_tensor():
   # TODO(b/178540516): Make a custom `setattr` that changes the method's
   #   docstring to the TF one.
   setattr(ops.Tensor, 'transpose', np_array_ops.transpose)
+  setattr(ops.Tensor, 'flatten', np_array_ops.flatten)
   setattr(ops.Tensor, 'reshape', np_array_ops._reshape_method_wrapper)  # pylint: disable=protected-access
   setattr(ops.Tensor, 'ravel', np_array_ops.ravel)
   setattr(ops.Tensor, 'clip', clip)

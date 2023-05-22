@@ -19,8 +19,8 @@ limitations under the License.
 #include "absl/strings/str_join.h"
 #include "tensorflow/compiler/xla/tests/hlo_test_base.h"
 #include "tensorflow/compiler/xla/tests/test_macros.h"
-#include "tensorflow/core/platform/test.h"
-#include "tensorflow/core/platform/types.h"
+#include "tensorflow/compiler/xla/tests/test_utils.h"
+#include "tensorflow/tsl/platform/test.h"
 
 // Tests the Reduce HLO in ways that can't be done using the ComputationBuilder
 // API.
@@ -32,13 +32,13 @@ struct ReduceLayout {
   std::array<int64_t, 4> input_minor_to_major;
   std::array<int64_t, 3> output_minor_to_major;
 
-  string ToString() const {
+  std::string ToString() const {
     return absl::StrCat(absl::StrJoin(input_minor_to_major, "x"), "_",
                         absl::StrJoin(output_minor_to_major, "x"));
   }
 };
 
-string PrintReduceLayout(
+std::string PrintReduceLayout(
     ::testing::TestParamInfo<ReduceLayout> reduce_layout_param) {
   return reduce_layout_param.param.ToString();
 }
@@ -74,6 +74,10 @@ ENTRY reduce.1 {
 };
 
 XLA_TEST_P(ReduceWithLayoutTest, Reduce) {
+  if (IsMlirLoweringEnabled()) {
+    GTEST_SKIP() << "Explicit layouts not supported by MLIR";
+  }
+
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module, GetParsedModule());
   HloInstruction* reduce_instruction =
       module->entry_computation()->root_instruction()->mutable_operand(0);

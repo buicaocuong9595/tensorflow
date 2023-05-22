@@ -14,7 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 // See docs in ../ops/array_ops.cc.
-#ifdef INTEL_MKL
+#if defined(INTEL_MKL)
 #define EIGEN_USE_THREADS
 
 #include <math.h>
@@ -79,7 +79,7 @@ class MklRequantizationRangePerChannelOp : public OpKernel {
     Eigen::array<int, 2> shuffling({1, 0});
     auto input_matrix = input.flat_inner_dims<qint32>();
 
-    // TODO: verify performance of not transposing and finding the min max
+    // TODO(intel-tf): Verify performance of not transposing and finding min max
     // directly from input_matrix vs the one presented below of transposing and
     // using the transposed matrix as the transposing operation in itself might
     // be more costly.
@@ -97,7 +97,7 @@ class MklRequantizationRangePerChannelOp : public OpKernel {
 #pragma omp parallel for reduction(max : out_min_max)
 #endif
 #endif  // ENABLE_ONEDNN_OPENMP
-    // TODO: Add eigen parallel_for
+    // TODO(intel-tf): Add eigen parallel_for
     for (int64_t i = 0; i < depth; ++i) {
       Eigen::Tensor<qint32, 0, Eigen::RowMajor> min =
           transposed_input.chip<0>(i).minimum();
@@ -128,8 +128,8 @@ class MklRequantizationRangePerChannelOp : public OpKernel {
     Tensor* output_max = nullptr;
     OP_REQUIRES_OK(ctx, ctx->allocate_output(kOutputMinIndex, {}, &output_min));
     OP_REQUIRES_OK(ctx, ctx->allocate_output(kOutputMaxIndex, {}, &output_max));
-    output_min->flat<float>()(0) = is_non_negative ? 0.0f : -out_min_max;
-    output_max->flat<float>()(0) = out_min_max;
+    output_min->scalar<float>()() = is_non_negative ? 0.0f : -out_min_max;
+    output_max->scalar<float>()() = out_min_max;
   }
 
  private:

@@ -63,7 +63,7 @@ GraphMgr::GraphMgr(const WorkerEnv* worker_env, const DeviceMgr* device_mgr)
   Status status =
       ReadBoolFromEnvVar("TF_SYNC_ON_FINISH", true, &sync_on_finish_);
   if (!status.ok()) {
-    LOG(ERROR) << status.error_message();
+    LOG(ERROR) << status.message();
   }
 }
 
@@ -98,7 +98,7 @@ static Status ValidateGraphDefForDevices(const GraphDef& gdef) {
                                      FormatNodeDefForError(ndef));
     }
   }
-  return Status::OK();
+  return OkStatus();
 }
 
 Status GraphMgr::DecorateAndPublishGraphForDebug(
@@ -108,7 +108,7 @@ Status GraphMgr::DecorateAndPublishGraphForDebug(
       DebugGraphDecoratorRegistry::CreateDecorator(debug_options, &decorator));
   TF_RETURN_IF_ERROR(decorator->DecorateGraph(graph, device));
   TF_RETURN_IF_ERROR(decorator->PublishGraph(*graph, device->name()));
-  return Status::OK();
+  return OkStatus();
 }
 
 // Creates executors given a graph definition "gdef" of a "session".
@@ -122,11 +122,13 @@ Status GraphMgr::DecorateAndPublishGraphForDebug(
 //
 // "executors" are filled with one executor per device if success and
 // the caller takes the ownership of returned executors.
-Status GraphMgr::InitItem(
-    const string& handle, const GraphDef& gdef, WorkerSession* session,
-    const GraphOptions& graph_options, const DebugOptions& debug_options,
-    const ConfigProto& config_proto, int64_t collective_graph_key,
-    DistributedFunctionLibraryRuntime* cluster_flr, Item* item) {
+Status GraphMgr::InitItem(const string& handle, const GraphDef& gdef,
+                          const GraphOptions& graph_options,
+                          const DebugOptions& debug_options,
+                          const ConfigProto& config_proto,
+                          int64_t collective_graph_key, WorkerSession* session,
+                          DistributedFunctionLibraryRuntime* cluster_flr,
+                          Item* item) {
   item->session = handle;
   item->collective_graph_key = collective_graph_key;
   item->lib_def.reset(
@@ -143,15 +145,12 @@ Status GraphMgr::InitItem(
       /*session_metadata=*/nullptr,
       Rendezvous::Factory{
           [this, session](const int64_t step_id, const DeviceMgr*,
-                          Rendezvous** r) -> Status {
-            auto* remote_r = this->worker_env_->rendezvous_mgr->Find(step_id);
+                          tsl::core::RefCountPtr<Rendezvous>* r) -> Status {
+            tsl::core::RefCountPtr<RemoteRendezvous> remote_r =
+                this->worker_env_->rendezvous_mgr->Find(step_id);
             TF_RETURN_IF_ERROR(remote_r->Initialize(session));
-            *r = remote_r;
-            return Status::OK();
-          },
-          [this](const int64_t step_id) {
-            this->worker_env_->rendezvous_mgr->Cleanup(step_id);
-            return Status::OK();
+            *r = std::move(remote_r);
+            return OkStatus();
           }}));
 
   // Constructs the graph out of "gdef".
@@ -289,17 +288,19 @@ Status GraphMgr::InitItem(
     }
     TF_RETURN_IF_ERROR(NewLocalExecutor(params, *unit->graph, &unit->root));
   }
-  return Status::OK();
+  return OkStatus();
 }
 
-Status GraphMgr::Register(
-    const string& handle, const GraphDef& gdef, WorkerSession* session,
-    const GraphOptions& graph_options, const DebugOptions& debug_options,
-    const ConfigProto& config_proto, int64_t collective_graph_key,
-    DistributedFunctionLibraryRuntime* cluster_flr, string* graph_handle) {
+Status GraphMgr::Register(const string& handle, const GraphDef& gdef,
+                          const GraphOptions& graph_options,
+                          const DebugOptions& debug_options,
+                          const ConfigProto& config_proto,
+                          int64_t collective_graph_key, WorkerSession* session,
+                          DistributedFunctionLibraryRuntime* cluster_flr,
+                          string* graph_handle) {
   Item* item = new Item;
-  Status s = InitItem(handle, gdef, session, graph_options, debug_options,
-                      config_proto, collective_graph_key, cluster_flr, item);
+  Status s = InitItem(handle, gdef, graph_options, debug_options, config_proto,
+                      collective_graph_key, session, cluster_flr, item);
   if (!s.ok()) {
     item->Unref();
     return s;
@@ -313,7 +314,7 @@ Status GraphMgr::Register(
     item->handle = *graph_handle;
     CHECK(table_.insert({*graph_handle, item}).second);
   }
-  return Status::OK();
+  return OkStatus();
 }
 
 Status GraphMgr::Deregister(const string& handle) {
@@ -330,7 +331,7 @@ Status GraphMgr::Deregister(const string& handle) {
     table_.erase(iter);
   }
   item->Unref();
-  return Status::OK();
+  return OkStatus();
 }
 
 Status GraphMgr::DeregisterAll() {
@@ -346,11 +347,11 @@ Status GraphMgr::DeregisterAll() {
   for (auto item : items) {
     item->Unref();
   }
-  return Status::OK();
+  return OkStatus();
 }
 
 Status GraphMgr::SendInputs(const int64_t step_id, const NamedTensors& in) {
-  Rendezvous* rendezvous = worker_env_->rendezvous_mgr->Find(step_id);
+  Rendezvous* rendezvous = worker_env_->rendezvous_mgr->Find(step_id).release();
   std::vector<string> keys;
   std::vector<Tensor> tensors_to_send;
   keys.reserve(in.size());
@@ -369,14 +370,14 @@ Status GraphMgr::SendInputs(const int64_t step_id, const NamedTensors& in) {
 }
 
 Status GraphMgr::RecvOutputs(const int64_t step_id, NamedTensors* out) {
-  Rendezvous* rendezvous = worker_env_->rendezvous_mgr->Find(step_id);
+  Rendezvous* rendezvous = worker_env_->rendezvous_mgr->Find(step_id).release();
   Status s = RecvOutputsFromRendezvous(rendezvous, out, Rendezvous::Args());
   rendezvous->Unref();
   if (!s.ok()) {
     // Failing to fetch the outputs should not be possible, so rewrite the error
     // status to an INTERNAL error.
     s = errors::Internal("Failed to fetch outputs for step ", step_id,
-                         ". (Original error message: ", s.error_message(), ")");
+                         ". (Original error message: ", s.message(), ")");
   }
   size_t output_size = 0;
   for (auto& p : *out) {
@@ -388,7 +389,7 @@ Status GraphMgr::RecvOutputs(const int64_t step_id, NamedTensors* out) {
 
 void GraphMgr::RecvOutputsAsync(const int64_t step_id, NamedTensors* out,
                                 StatusCallback done) {
-  Rendezvous* rendezvous = worker_env_->rendezvous_mgr->Find(step_id);
+  Rendezvous* rendezvous = worker_env_->rendezvous_mgr->Find(step_id).release();
   std::vector<string> keys;
   std::vector<Tensor>* received_keys = new std::vector<Tensor>;
   keys.reserve(out->size());
@@ -412,12 +413,13 @@ void GraphMgr::RecvOutputsAsync(const int64_t step_id, NamedTensors* out,
       });
 }
 
-void GraphMgr::ExecuteAsync(const string& handle, const int64_t step_id,
-                            WorkerSession* session, const ExecutorOpts& opts,
-                            StepStatsCollector* collector,
-                            MutableRunGraphResponseWrapper* response,
-                            CancellationManager* cancellation_manager,
-                            const NamedTensors& in, StatusCallback done) {
+void GraphMgr::ExecuteAsync(
+    const string& handle, const int64_t step_id, const ExecutorOpts& opts,
+    const NamedTensors& in, WorkerSession* session,
+    StepStatsCollector* collector, MutableRunGraphResponseWrapper* response,
+    CancellationManager* cancellation_manager,
+    tsl::CoordinationServiceAgent* coordination_service_agent,
+    StatusCallback done) {
   const uint64 start_time_usecs = Env::Default()->NowMicros();
   profiler::TraceMeProducer activity(
       // To TraceMeConsumers in ExecutorState::Process/Finish or RunGraphDone.
@@ -455,7 +457,8 @@ void GraphMgr::ExecuteAsync(const string& handle, const int64_t step_id,
     }
   }
 
-  RemoteRendezvous* rendezvous = worker_env_->rendezvous_mgr->Find(step_id);
+  RemoteRendezvous* rendezvous =
+      worker_env_->rendezvous_mgr->Find(step_id).release();
   Status s = rendezvous->Initialize(session);
   CollectiveExecutor::Handle* ce_handle =
       item->collective_graph_key != BuildGraphOptions::kNoCollectiveGraphKey
@@ -489,6 +492,7 @@ void GraphMgr::ExecuteAsync(const string& handle, const int64_t step_id,
   StartParallelExecutors(
       handle, step_id, item, rendezvous, ce_handle, collector, cost_graph,
       cancellation_manager, session, start_time_usecs,
+      coordination_service_agent,
       [item, rendezvous, ce_handle, done, start_time_usecs, input_size,
        step_id](const Status& s) {
         profiler::TraceMeConsumer activity(
@@ -512,7 +516,9 @@ void GraphMgr::StartParallelExecutors(
     const string& handle, int64_t step_id, Item* item, Rendezvous* rendezvous,
     CollectiveExecutor::Handle* ce_handle, StepStatsCollector* collector,
     CostGraphDef* cost_graph, CancellationManager* cancellation_manager,
-    WorkerSession* session, int64_t start_time_usecs, StatusCallback done) {
+    WorkerSession* session, int64_t start_time_usecs,
+    tsl::CoordinationServiceAgent* coordination_service_agent,
+    StatusCallback done) {
   const int num_units = item->units.size();
   CHECK_GE(num_units, 1);
   ScopedStepContainer* step_container = new ScopedStepContainer(
@@ -536,6 +542,8 @@ void GraphMgr::StartParallelExecutors(
   args.step_container = step_container;
   args.sync_on_finish = sync_on_finish_;
   args.start_time_usecs = start_time_usecs;
+  args.coordination_service_agent = coordination_service_agent;
+
   if (LogMemory::IsEnabled()) {
     LogMemory::RecordStep(args.step_id, handle);
   }

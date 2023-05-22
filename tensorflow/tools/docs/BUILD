@@ -2,9 +2,7 @@
 #   Doc generator
 
 load("//tensorflow:tensorflow.bzl", "py_test")
-
-# buildifier: disable=same-origin-load
-load("//tensorflow:tensorflow.bzl", "get_compatible_with_portable")
+load("//tensorflow:tensorflow.default.bzl", "get_compatible_with_portable")
 load("//tensorflow/python/tpu:tpu.bzl", "tpu_py_test")
 load(
     "//tensorflow/core/platform:build_config_root.bzl",
@@ -12,6 +10,7 @@ load(
 )
 
 package(
+    # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
     default_visibility = ["//tensorflow:__subpackages__"],
     licenses = ["notice"],
 )
@@ -24,7 +23,6 @@ tpu_module = [
 ]
 
 keras_module = [
-    # TODO(scottzhu): Move the Keras docstring test to Keras repo.
     "keras.",
 ]
 
@@ -52,18 +50,19 @@ py_test(
     srcs = ["tf_doctest.py"],
     args = ["--module_prefix_skip=" + ",".join(tpu_module + distribute_module + keras_module)],
     python_version = "PY3",
+    shard_count = 4,
     tags = [
-        "no_oss_py2",
+        "no_oss",  # b/275546007
         "no_pip",
         "no_rocm",  # No need to rerun this test for ROCm config.
         "no_windows",  # numpy prints differently on windows.
         "noasan",
-        "nomsan",
-        "notsan",
     ],
     deps = [
         ":tf_doctest_lib",
         "//tensorflow:tensorflow_py",
+        "//tensorflow/python:logging_ops",
+        "//tensorflow/python/distribute:distribute_lib",
         "//third_party/py/numpy",
         "@absl_py//absl/flags",
         "@absl_py//absl/testing:absltest",
@@ -79,12 +78,7 @@ tpu_py_test(
     disable_v3 = True,
     main = "tf_doctest.py",
     python_version = "PY3",
-    tags = [
-        "no_oss",
-        "noasan",
-        "nomsan",
-        "notsan",
-    ],
+    tags = ["no_oss"],
     deps = [
         ":tf_doctest_lib",
         "//tensorflow:tensorflow_py",
@@ -103,7 +97,6 @@ py_test(
     main = "tf_doctest.py",
     python_version = "PY3",
     tags = [
-        "no_oss_py2",
         "no_pip",
         "no_rocm",
         "no_windows",  # numpy prints differently on windows.
@@ -114,6 +107,8 @@ py_test(
     deps = [
         ":tf_doctest_lib",
         "//tensorflow:tensorflow_py",
+        "//tensorflow/python:logging_ops",
+        "//tensorflow/python/distribute:distribute_lib",
         "//third_party/py/numpy",
         "@absl_py//absl/flags",
         "@absl_py//absl/testing:absltest",
@@ -124,15 +119,32 @@ py_test(
     name = "tf_doctest_test",
     srcs = ["tf_doctest_test.py"],
     python_version = "PY3",
-    tags = [
-        "no_oss_py2",
-        "no_pip",
-        "noasan",
-        "nomsan",
-        "notsan",
-    ],
+    tags = ["no_pip"],
     deps = [
         ":tf_doctest_lib",
+        "@absl_py//absl/testing:absltest",
+        "@absl_py//absl/testing:parameterized",
+    ],
+)
+
+py_library(
+    name = "fenced_doctest_lib",
+    srcs = ["fenced_doctest_lib.py"],
+    deps = [
+        ":tf_doctest_lib",
+        "@astor_archive//:astor",
+    ],
+)
+
+py_test(
+    name = "fenced_doctest_test",
+    srcs = ["fenced_doctest_test.py"],
+    tags = [
+        "no_oss",
+        "no_pip",
+    ],
+    deps = [
+        ":fenced_doctest_lib",
         "@absl_py//absl/testing:absltest",
         "@absl_py//absl/testing:parameterized",
     ],
@@ -154,14 +166,11 @@ py_test(
     srcs_version = "PY3",
     tags = [
         "manual",
-        # No reason to run sanitizers or fastbuild for this test.
-        "noasan",
-        "nomsan",
-        "notsan",
         "optonly",
     ],
     deps = [
         ":generate2_lib",
+        # copybara:uncomment "//third_party/py/tensorflow:tensorflow_estimator",
         "//tensorflow:tensorflow_py",
         "//tensorflow/python:platform_test",
     ],
@@ -191,10 +200,20 @@ py_library(
     srcs_version = "PY3",
     deps = [
         ":base_dir_oss",
+        # copybara:uncomment "//third_party/py/tensorflow:tensorflow_estimator",
         "//tensorflow:tensorflow_py",
         "//tensorflow/python:framework_ops",
-        "//tensorflow/python:util",
         "//tensorflow/python/util:tf_export",
+        "//tensorflow/python/util:tf_inspect",
+        "@absl_py//absl:app",
+        "@absl_py//absl/flags",
+    ],
+)
+
+py_binary(
+    name = "build_cc_api_headers",
+    srcs = ["build_cc_api_headers.py"],
+    deps = [
         "@absl_py//absl:app",
         "@absl_py//absl/flags",
     ],

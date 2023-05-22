@@ -33,6 +33,9 @@ namespace data {
 // should be supplied by the auto-sharding rewrite.
 constexpr int kShardHint = -1;
 
+// The initial parallelism value before Autotune has a chance to optimize.
+constexpr int kAutotuneDefaultParallelism = 16;
+
 // Creates a resource handle with a unique name for the given resource where
 // the resource is managed by the Resource Manager.
 template <typename T>
@@ -46,7 +49,7 @@ Status CreateWeakHandle(OpKernelContext* ctx, T* resource,
 
   *handle = MakeResourceHandle(container_name, unique_name, *ctx->device(),
                                TypeIndex::Make<T>());
-  return Status::OK();
+  return OkStatus();
 }
 
 // Creates a ref-counting resource handle for the given resource, where the
@@ -58,7 +61,7 @@ Status CreateHandle(OpKernelContext* ctx, T* resource, ResourceHandle* handle) {
       ResourceHandle::MakeRefCountingHandle(resource, ctx->device()->name());
   TF_RETURN_IF_ERROR(
       mgr->CreateUnowned<T>(handle->container(), handle->name(), resource));
-  return Status::OK();
+  return OkStatus();
 }
 
 // TODO(b/198162355): Merge this class with ResourceOpKernel.
@@ -103,10 +106,8 @@ class AnonymousResourceOp : public OpKernel {
       attr.set_on_host(true);
       OP_REQUIRES_OK(
           ctx, ctx->allocate_output(1, TensorShape({}), &deleter_t, attr));
-      if (ref_counting_) {
-        // A dummy output that does nothing when destroyed.
-        deleter_t->scalar<int>()() = 0;
-      } else {
+      // TODO(feyu): Consider returning an OptionalVariant.
+      if (!ref_counting_) {
         // A deleter output that deletes the resource when destroyed.
         deleter_t->scalar<Variant>()() =
             ResourceDeleter(handle, ctx->resource_manager());
@@ -127,7 +128,7 @@ class AnonymousResourceOp : public OpKernel {
   const bool return_deleter_;
 };
 
-// Returns Status::OK() if `expected` and `received` types match,
+// Returns OkStatus() if `expected` and `received` types match,
 // errors::InvalidArgument otherwise.
 Status VerifyTypesMatch(const DataTypeVector& expected,
                         const DataTypeVector& received);
@@ -135,7 +136,7 @@ Status VerifyTypesMatch(const DataTypeVector& expected,
 Status VerifyTypesMatch(const DataTypeVector& expected,
                         const std::vector<Tensor>& received);
 
-// Returns Status::OK() if `expected` and `received` shapes are compatible,
+// Returns OkStatus() if `expected` and `received` shapes are compatible,
 // errors::InvalidArgument otherwise.
 Status VerifyShapesCompatible(const std::vector<PartialTensorShape>& expected,
                               const std::vector<PartialTensorShape>& received);
@@ -310,12 +311,14 @@ Status CopyBatch(CopyBatchParams params,
                  std::function<Status()> allocation_callback,
                  std::vector<Tensor>* out_tensors);
 
-// Computes the set of experiments to apply based on the job name, rollout
-// percentage of registered experiments, and the TF_DATA_EXPERIMENT_OPT_IN and
-// TF_DATA_EXPERIMENT_OPT_OUT environment variables.
+// Computes the set of experiments to apply based on the job name, task id,
+// rollout percentage of registered experiments, and the
+// TF_DATA_EXPERIMENT_OPT_IN and TF_DATA_EXPERIMENT_OPT_OUT environment
+// variables.
 absl::flat_hash_set<string> GetExperiments();
 absl::flat_hash_set<string> GetExperiments(
-    const string& job_name, std::function<uint64(const string&)> hash_func);
+    const std::string& job_name, int64_t task_id,
+    std::function<uint64_t(const string&)> hash_func);
 
 // Logs and records the experiments that will be applied.
 void LogAndRecordExperiments(const absl::flat_hash_set<string>& experiments);
@@ -327,13 +330,6 @@ void GetOptimizations(const Options& options,
                       absl::flat_hash_set<tstring>* optimizations_enabled,
                       absl::flat_hash_set<tstring>* optimizations_disabled,
                       absl::flat_hash_set<tstring>* optimizations_default);
-
-// Determines which optimizations should be applied.
-absl::flat_hash_set<tstring> SelectOptimizations(
-    const absl::flat_hash_set<string>& experiments,
-    const absl::flat_hash_set<tstring>& optimizations_enabled,
-    const absl::flat_hash_set<tstring>& optimizations_disabled,
-    const absl::flat_hash_set<tstring>& optimizations_default);
 
 // Creates graph rewrite configs based on the given options. The configs will
 // only be used if their corresponding optimizers registered with Grappler are
@@ -363,35 +359,72 @@ inline int GetCpuBudget() {
   return (in_experiment ? 1.2 : 1.0) * port::NumSchedulableCPUs();
 }
 
+// Returns the initial value for parallelism parameter before the first Autotune
+// optimization.
+int64 GetAutotuneDefaultParallelism(IteratorContext* ctx);
+
+// A `DatasetExperimentRegistry::JobSelector` that randomly selects
+// `rollout_pct` percent of all jobs. `name_hash` is a hash of the experiment
+// and job names.
+template <int64_t rollout_pct>
+bool RandomJobSamplePercentage(uint64_t name_hash) {
+  return name_hash % 100 < rollout_pct;
+}
+
+// A `DatasetExperimentRegistry::TaskSelector` that selects all tasks.
+bool AllTasks(int64_t unused_task_id, bool unused_evens);
+
+// A `DatasetExperimentRegistry::TaskSelector` that selects the tasks for half
+// of all hosts. Typically, one or two consecutive tasks run on a single host.
+// If `evens` is `true`, selects tasks 0,1,4,5,8,9,..., otherwise selects tasks
+// 2,3,6,7,10,11,...
+bool IndependentHostTasks(int64_t task_id, bool evens);
+
 // Registry of tf.data experiments.
 class DatasetExperimentRegistry {
  public:
+  using JobSelector = std::function<bool(uint64_t name_hash)>;
+  using TaskSelector = std::function<bool(int64_t task_id, bool evens)>;
+
+  struct ExperimentSelector {
+    JobSelector job_selector;
+    TaskSelector task_selector;
+  };
+
   // Registers the experiment.
-  static void Register(const string& experiment, int64_t rollout_pct);
+  static void Register(const string& experiment, JobSelector job_selector,
+                       TaskSelector task_selector);
 
   // Returns all registered experiments.
-  static absl::flat_hash_map<string, int64_t> Experiments();
+  static absl::flat_hash_map<string, ExperimentSelector> Experiments();
 };
 
 // Helper class to register a dataset experiment.
 class DatasetExperimentRegistrar {
  public:
-  explicit DatasetExperimentRegistrar(const string& experiment,
-                                      int64_t rollout_pct) {
-    DatasetExperimentRegistry::Register(experiment, rollout_pct);
+  explicit DatasetExperimentRegistrar(
+      const string& experiment,
+      DatasetExperimentRegistry::JobSelector job_selector,
+      DatasetExperimentRegistry::TaskSelector task_selector) {
+    DatasetExperimentRegistry::Register(experiment, job_selector,
+                                        task_selector);
   }
 };
 
 // Macro that can be used to register a dataset experiment.
-#define REGISTER_DATASET_EXPERIMENT(experiment, rollout_pct) \
-  REGISTER_DATASET_OP_NAME_UNIQ_HELPER(__COUNTER__, experiment, rollout_pct)
+#define REGISTER_DATASET_EXPERIMENT(experiment, job_selector, task_selector)  \
+  REGISTER_DATASET_OP_NAME_UNIQ_HELPER(__COUNTER__, experiment, job_selector, \
+                                       task_selector)
 
-#define REGISTER_DATASET_OP_NAME_UNIQ_HELPER(ctr, experiment, rollout_pct) \
-  REGISTER_DATASET_OP_NAME_UNIQ(ctr, experiment, rollout_pct)
+#define REGISTER_DATASET_OP_NAME_UNIQ_HELPER(ctr, experiment, job_selector, \
+                                             task_selector)                 \
+  REGISTER_DATASET_OP_NAME_UNIQ(ctr, experiment, job_selector, task_selector)
 
-#define REGISTER_DATASET_OP_NAME_UNIQ(ctr, experiment, rollout_pct) \
-  static ::tensorflow::data::DatasetExperimentRegistrar             \
-      registrar__body__##ctr##__object(experiment, rollout_pct)
+#define REGISTER_DATASET_OP_NAME_UNIQ(ctr, experiment, job_selector, \
+                                      task_selector)                 \
+  static ::tensorflow::data::DatasetExperimentRegistrar              \
+      registrar__body__##ctr##__object(experiment, job_selector,     \
+                                       task_selector)
 
 }  // namespace data
 }  // namespace tensorflow

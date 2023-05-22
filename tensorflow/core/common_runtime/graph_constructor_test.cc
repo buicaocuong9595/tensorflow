@@ -63,13 +63,12 @@ class GraphConstructorTest : public ::testing::Test {
     EXPECT_FALSE(status.ok());
 
     for (const string& error : expected_error_strs) {
-      EXPECT_TRUE(status.error_message().find(error) != string::npos)
+      EXPECT_TRUE(absl::StrContains(status.message(), error))
           << "Expected to find '" << error << "' in " << status;
     }
 
     if (!not_expected_error_str.empty()) {
-      EXPECT_TRUE(status.error_message().find(not_expected_error_str) ==
-                  string::npos)
+      EXPECT_TRUE(!absl::StrContains(status.message(), not_expected_error_str))
           << "Expected not to find '" << not_expected_error_str << "' in "
           << status;
     }
@@ -89,7 +88,7 @@ class GraphConstructorTest : public ::testing::Test {
     EXPECT_FALSE(status.ok());
 
     for (const string& error : expected_error_strs) {
-      EXPECT_TRUE(status.error_message().find(error) != string::npos)
+      EXPECT_TRUE(absl::StrContains(status.message(), error))
           << "Expected to find '" << error << "' in " << status;
     }
 
@@ -107,7 +106,7 @@ class GraphConstructorTest : public ::testing::Test {
                 ImportGraphDefResults* results = nullptr) {
     Convert(gdef_ascii);
     Status s = ImportGraphDef(opts, gdef_, &graph_, refiner, results);
-    EXPECT_EQ(Status::OK(), s) << s;
+    EXPECT_EQ(OkStatus(), s) << s;
   }
 
   void ExpectVersions(int min_consumer, int producer) {
@@ -182,7 +181,7 @@ Status Scalars(shape_inference::InferenceContext* c) {
   for (int i = 0; i < c->num_outputs(); ++i) {
     c->set_output(i, c->Scalar());
   }
-  return Status::OK();
+  return OkStatus();
 }
 
 REGISTER_OP("ABC");
@@ -810,7 +809,7 @@ versions {
 
   ImportGraphDefOptions opts;
   auto s = ImportGraphDef(opts, def, &graph_, nullptr);
-  ASSERT_EQ(Status::OK(), s) << s;
+  ASSERT_EQ(OkStatus(), s) << s;
 }
 
 TEST_F(GraphConstructorTest, TypeMismatch) {
@@ -931,7 +930,7 @@ TEST_F(GraphConstructorTest, ImportGraphDef) {
 
   // Importing an empty graph is fine.
   Status s = ImportGraphDef(opts, def, &graph_, nullptr);
-  ASSERT_EQ(Status::OK(), s) << s;
+  ASSERT_EQ(OkStatus(), s) << s;
   EXPECT_EQ(2, graph_.num_nodes());
   EXPECT_TRUE(HasControlEdge(source, sink));
   EXPECT_EQ(1, graph_.num_edges());
@@ -966,7 +965,7 @@ TEST_F(GraphConstructorTest, ImportGraphDef) {
 
   // First import should work out fine.
   s = ImportGraphDef(opts, def, &graph_, nullptr);
-  ASSERT_EQ(Status::OK(), s) << s;
+  ASSERT_EQ(OkStatus(), s) << s;
   EXPECT_EQ(5 + 2, graph_.num_nodes());  // Added nodes + source and sink
   EXPECT_EQ("A", ColocationGroup("B"));
   EXPECT_TRUE(HasEdge("A", 0, "B", 0));
@@ -987,7 +986,7 @@ TEST_F(GraphConstructorTest, ImportGraphDef) {
   // But succeed if a unique prefix is provided.
   opts.prefix = "import";
   s = ImportGraphDef(opts, def, &graph_, nullptr);
-  ASSERT_EQ(Status::OK(), s) << s;
+  ASSERT_EQ(OkStatus(), s) << s;
   EXPECT_EQ(
       10 + 2,
       graph_.num_nodes());  // Added nodes + original nodes + source and sink
@@ -1018,7 +1017,7 @@ TEST_F(GraphConstructorTest, ImportGraphDef_DefaultAttrs) {
   ASSERT_TRUE(protobuf::TextFormat::ParseFromString(
       "node{ name:'A' op:'TestDefaultAttr'}", &def));
   Status s = ImportGraphDef(ImportGraphDefOptions(), def, &graph_, nullptr);
-  ASSERT_EQ(Status::OK(), s) << s;
+  ASSERT_EQ(OkStatus(), s) << s;
   Node* a = nullptr;
   for (Node* n : graph_.nodes()) {
     if (n->name() == "A") {
@@ -1029,7 +1028,7 @@ TEST_F(GraphConstructorTest, ImportGraphDef_DefaultAttrs) {
   ASSERT_TRUE(a != nullptr);
   int value = 0;
   s = GetNodeAttr(a->attrs(), "default_int", &value);
-  ASSERT_EQ(Status::OK(), s) << s << " -- " << a->def().DebugString();
+  ASSERT_EQ(OkStatus(), s) << s << " -- " << a->def().DebugString();
   EXPECT_EQ(31415, value);
 }
 
@@ -1054,14 +1053,14 @@ TEST_F(GraphConstructorTest, ImportGraphDef_Versioning) {
   def.mutable_versions()->Clear();
   graph_.ToGraphDef(&def);
   s = ImportGraphDef(opts, def, &graph_, nullptr);
-  EXPECT_EQ(Status::OK(), s) << s;
+  EXPECT_EQ(OkStatus(), s) << s;
 
   def.Clear();
   const int original_min_consumer = graph_.versions().min_consumer();
   def.mutable_versions()->set_min_consumer(original_min_consumer + 2);
   def.mutable_versions()->add_bad_consumers(TF_GRAPH_DEF_VERSION - 1);
   s = ImportGraphDef(opts, def, &graph_, nullptr);
-  EXPECT_EQ(Status::OK(), s) << s;
+  EXPECT_EQ(OkStatus(), s) << s;
   EXPECT_EQ(original_min_consumer + 2, graph_.versions().min_consumer());
   ASSERT_EQ(1, graph_.versions().bad_consumers_size());
   EXPECT_EQ(TF_GRAPH_DEF_VERSION - 1, graph_.versions().bad_consumers(0));
@@ -1160,15 +1159,15 @@ node {
       &def);
   ASSERT_TRUE(parsed);
   Status s = ImportGraphDef(ImportGraphDefOptions(), def, &graph_, nullptr);
-  EXPECT_EQ(Status::OK(), s) << s;
+  EXPECT_EQ(OkStatus(), s) << s;
 
   Graph g2(OpRegistry::Global());
   def.mutable_versions()->set_producer(10);
   s = ImportGraphDef(ImportGraphDefOptions(), def, &g2, nullptr);
   EXPECT_EQ(error::UNIMPLEMENTED, s.code());
-  EXPECT_TRUE(s.error_message().find("BatchNormWithGlobalNormalization is not "
-                                     "available in GraphDef version 10") !=
-              string::npos)
+  EXPECT_TRUE(absl::StrContains(s.message(),
+                                "BatchNormWithGlobalNormalization is not "
+                                "available in GraphDef version 10"))
       << s;
 }
 
@@ -2254,7 +2253,7 @@ versions {
       &def);
   ASSERT_TRUE(parsed);
   Status s = ImportGraphDef(ImportGraphDefOptions(), def, &graph_, nullptr);
-  EXPECT_EQ(Status::OK(), s) << s;
+  EXPECT_EQ(OkStatus(), s) << s;
 }
 
 TEST_F(GraphConstructorTest, ImportGraphDef_ControlDeps) {
@@ -2442,7 +2441,7 @@ TEST_F(GraphConstructorTest, ImportGraphDef_ErrorsDoNoChangeTheGraph) {
   const string& sink = graph_.FindNodeId(Graph::kSinkId)->name();
 
   Status s = ImportGraphDef(opts, def, &graph_, nullptr);
-  ASSERT_EQ(Status::OK(), s) << s;
+  ASSERT_EQ(OkStatus(), s) << s;
   EXPECT_EQ(3, graph_.num_nodes());  // 'scope/A', source and sink
   EXPECT_TRUE(HasControlEdge(source, sink));
   EXPECT_TRUE(HasControlEdge(source, "scope/A"));
@@ -2450,18 +2449,18 @@ TEST_F(GraphConstructorTest, ImportGraphDef_ErrorsDoNoChangeTheGraph) {
   EXPECT_EQ(3, graph_.num_edges());
   const string original_graph_description = GraphDebugString();
 
-#define EXPECT_IMPORT_FAILURE(graph_def, options, expected_err)             \
-  do {                                                                      \
-    Status s = ImportGraphDef(options, graph_def, &graph_, nullptr);        \
-    EXPECT_NE(Status::OK(), s) << s;                                        \
-    EXPECT_TRUE(s.error_message().find(expected_err) != string::npos) << s; \
-    const string graph_description = GraphDebugString();                    \
-    EXPECT_EQ(original_graph_description, graph_description);               \
-    EXPECT_EQ(3, graph_.num_nodes());                                       \
-    EXPECT_TRUE(HasControlEdge(source, sink));                              \
-    EXPECT_TRUE(HasControlEdge(source, "scope/A"));                         \
-    EXPECT_TRUE(HasControlEdge("scope/A", sink));                           \
-    EXPECT_EQ(3, graph_.num_edges());                                       \
+#define EXPECT_IMPORT_FAILURE(graph_def, options, expected_err)       \
+  do {                                                                \
+    Status s = ImportGraphDef(options, graph_def, &graph_, nullptr);  \
+    EXPECT_NE(OkStatus(), s) << s;                                    \
+    EXPECT_TRUE(s.message().find(expected_err) != string::npos) << s; \
+    const string graph_description = GraphDebugString();              \
+    EXPECT_EQ(original_graph_description, graph_description);         \
+    EXPECT_EQ(3, graph_.num_nodes());                                 \
+    EXPECT_TRUE(HasControlEdge(source, sink));                        \
+    EXPECT_TRUE(HasControlEdge(source, "scope/A"));                   \
+    EXPECT_TRUE(HasControlEdge("scope/A", sink));                     \
+    EXPECT_EQ(3, graph_.num_edges());                                 \
   } while (0)
 
   EXPECT_IMPORT_FAILURE(def, opts,
@@ -2731,9 +2730,9 @@ TEST_F(GraphConstructorTest, ImportGraphDef_NestedFunctionDefs) {
   // Check that Inner and Outer have been imported
   const OpDef* op_def;
   Status s = graph_.op_registry()->LookUpOpDef("Inner_d03c39a3", &op_def);
-  ASSERT_TRUE(s.ok()) << s.error_message();
+  ASSERT_TRUE(s.ok()) << s.message();
   s = graph_.op_registry()->LookUpOpDef("Outer_966fa13d", &op_def);
-  ASSERT_TRUE(s.ok()) << s.error_message();
+  ASSERT_TRUE(s.ok()) << s.message();
 
   // Re-serialize and run the graph. This tests that re-serialized functions can
   // be imported again and that imported functions can be run.
@@ -2741,7 +2740,7 @@ TEST_F(GraphConstructorTest, ImportGraphDef_NestedFunctionDefs) {
   graph_.ToGraphDef(&gdef);
   std::unique_ptr<Session> sess(NewSession(SessionOptions()));
   s = sess->Create(gdef);
-  ASSERT_TRUE(s.ok()) << s.error_message();
+  ASSERT_TRUE(s.ok()) << s.message();
 
   Tensor p1(DT_FLOAT, TensorShape({1}));
   p1.scalar<float>()() = 1.0;
@@ -2753,7 +2752,7 @@ TEST_F(GraphConstructorTest, ImportGraphDef_NestedFunctionDefs) {
   std::vector<string> target_names;
   std::vector<Tensor> outputs;
   s = sess->Run(inputs, output_names, target_names, &outputs);
-  ASSERT_TRUE(s.ok()) << s.error_message();
+  ASSERT_TRUE(s.ok()) << s.message();
 
   ASSERT_EQ(outputs.size(), 1);
   EXPECT_EQ(outputs[0].scalar<float>()(), 3.0);
@@ -3232,7 +3231,7 @@ TEST_F(GraphConstructorTest, ImportGraphDef_ValidateDefaultDevice) {
   options.default_device = "/gpu:13";
   ImportGraphDefResults res;
 
-  TF_ASSERT_OK(ImportGraphDef(options, gdef, &graph_, NULL, &res));
+  TF_ASSERT_OK(ImportGraphDef(options, gdef, &graph_, nullptr, &res));
   std::map<string, string> node2dev;
   for (Node* n : graph_.nodes()) {
     node2dev[n->name()] = n->requested_device();
@@ -3253,7 +3252,7 @@ TEST_F(GraphConstructorTest, ImportGraphDef_UnknownOps) {
       {"Make sure the Op and Kernel are registered in the "
        "binary running in this process. Note that if you "
        "are loading a saved graph which used ops from "
-       "tf.contrib, accessing (e.g.) `tf.contrib.resampler` should be done "
+       "tf.contrib (e.g. `tf.contrib.resampler`), accessing should be done "
        "before importing the graph, as contrib ops are lazily registered "
        "when the module is first accessed."});
 }

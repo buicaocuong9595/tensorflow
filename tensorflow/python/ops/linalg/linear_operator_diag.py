@@ -15,6 +15,7 @@
 """`LinearOperator` acting like a diagonal matrix."""
 
 from tensorflow.python.framework import ops
+from tensorflow.python.framework import tensor_conversion
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import check_ops
 from tensorflow.python.ops import math_ops
@@ -169,8 +170,6 @@ class LinearOperatorDiag(linear_operator.LinearOperator):
           is_square=is_square,
           parameters=parameters,
           name=name)
-      # TODO(b/143910018) Remove graph_parents in V3.
-      self._set_graph_parents([self._diag])
 
   def _check_diag(self, diag):
     """Static check of diag."""
@@ -256,7 +255,7 @@ class LinearOperatorDiag(linear_operator.LinearOperator):
     return array_ops.matrix_set_diag(x, new_diag)
 
   def _eigvals(self):
-    return ops.convert_to_tensor_v2_with_dispatch(self.diag)
+    return tensor_conversion.convert_to_tensor_v2_with_dispatch(self.diag)
 
   def _cond(self):
     abs_diag = math_ops.abs(self.diag)
@@ -266,3 +265,7 @@ class LinearOperatorDiag(linear_operator.LinearOperator):
   @property
   def _composite_tensor_fields(self):
     return ("diag",)
+
+  @property
+  def _experimental_parameter_ndims_to_matrix_ndims(self):
+    return {"diag": 1}

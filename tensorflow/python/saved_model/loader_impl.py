@@ -21,7 +21,7 @@ import sys
 from google.protobuf import message
 from google.protobuf import text_format
 
-from tensorflow.core.protobuf import graph_debug_info_pb2
+from tensorflow.core.framework import graph_debug_info_pb2
 from tensorflow.core.protobuf import meta_graph_pb2
 from tensorflow.core.protobuf import saved_model_pb2
 from tensorflow.python.framework import ops
@@ -29,6 +29,7 @@ from tensorflow.python.lib.io import file_io
 from tensorflow.python.ops import variables
 from tensorflow.python.platform import tf_logging
 from tensorflow.python.saved_model import constants
+from tensorflow.python.saved_model import path_helpers
 from tensorflow.python.saved_model import signature_def_utils
 from tensorflow.python.saved_model import utils_impl as saved_model_utils
 from tensorflow.python.saved_model.pywrap_saved_model import metrics
@@ -54,10 +55,10 @@ def parse_saved_model_with_debug_info(export_dir):
     IOError: If the saved model file does not exist, or cannot be successfully
     parsed. Missing graph debug info file is fine.
   """
-  saved_model = _parse_saved_model(export_dir)
+  saved_model = parse_saved_model(export_dir)
 
   debug_info_path = file_io.join(
-      saved_model_utils.get_debug_dir(export_dir),
+      path_helpers.get_debug_dir(export_dir),
       constants.DEBUG_INFO_FILENAME_PB)
   debug_info = graph_debug_info_pb2.GraphDebugInfo()
   if file_io.file_exists(debug_info_path):
@@ -116,11 +117,6 @@ def parse_saved_model(export_dir):
         f"SavedModel file does not exist at: {export_dir}{os.path.sep}"
         f"{{{constants.SAVED_MODEL_FILENAME_PBTXT}|"
         f"{constants.SAVED_MODEL_FILENAME_PB}}}")
-
-
-# TODO(b/120594573): Make this symbol also available as private, so that
-# tensorflow_transform and tensorflow_estimator do not break.
-_parse_saved_model = parse_saved_model
 
 
 def get_asset_tensors(export_dir, meta_graph_def_to_load, import_scope=None):
@@ -261,22 +257,21 @@ def contains_saved_model(export_dir):
   provides no guarantee that it can be loaded.
 
   Args:
-    export_dir: Absolute string path to possible export location. For example,
+    export_dir: Absolute path to possible export location. For example,
                 '/my/foo/model'.
 
   Returns:
     True if the export directory contains SavedModel files, False otherwise.
   """
+  if isinstance(export_dir, os.PathLike):
+    export_dir = os.fspath(export_dir)
   return maybe_saved_model_directory(export_dir)
 
 
 @tf_export(v1=["saved_model.load", "saved_model.loader.load"])
 @deprecation.deprecated(
     None,
-    "This function will only be available through the v1 compatibility "
-    "library as tf.compat.v1.saved_model.loader.load or "
-    "tf.compat.v1.saved_model.load. There will be a new function for importing "
-    "SavedModels in Tensorflow 2.0.")
+    "Use `tf.saved_model.load` instead.")
 def load(sess, tags, export_dir, import_scope=None, **saver_kwargs):
   """Loads the model from a SavedModel as specified by tags.
 
@@ -354,7 +349,7 @@ class SavedModelLoader(object):
         variables to be loaded are located.
     """
     self._export_dir = export_dir
-    self._variables_path = saved_model_utils.get_variables_path(export_dir)
+    self._variables_path = path_helpers.get_variables_path(export_dir)
     self._saved_model = parse_saved_model(export_dir)
 
   @property

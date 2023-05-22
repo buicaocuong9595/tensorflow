@@ -37,10 +37,9 @@ class DeallocationTest : public ClientLibraryTestBase {
   // transferred from the device successfully.
   std::unique_ptr<GlobalData> ExecuteAndCheckTransfer(
       XlaBuilder* builder, absl::Span<GlobalData* const> arguments) {
-    XlaComputation computation = builder->Build().ConsumeValueOrDie();
+    XlaComputation computation = builder->Build().value();
     auto global_data =
-        client_->Execute(computation, arguments, &execution_options_)
-            .ConsumeValueOrDie();
+        client_->Execute(computation, arguments, &execution_options_).value();
     TF_CHECK_OK(client_->Transfer(*global_data).status());
     return global_data;
   }
@@ -60,7 +59,7 @@ TEST_F(DeallocationTest, DeallocateScalar) {
 
   auto transfer_status = client_->Transfer(*global_data);
   ASSERT_FALSE(transfer_status.ok());
-  ASSERT_THAT(transfer_status.status().error_message(),
+  ASSERT_THAT(transfer_status.status().message(),
               HasSubstr("was previously deallocated"));
 }
 
@@ -73,7 +72,7 @@ TEST_F(DeallocationTest, DeallocateVector) {
 
   auto transfer_status = client_->Transfer(*global_data);
   ASSERT_FALSE(transfer_status.ok());
-  ASSERT_THAT(transfer_status.status().error_message(),
+  ASSERT_THAT(transfer_status.status().message(),
               HasSubstr("was previously deallocated"));
 }
 
@@ -86,7 +85,7 @@ TEST_F(DeallocationTest, DeallocateEmptyVector) {
 
   auto transfer_status = client_->Transfer(*global_data);
   ASSERT_FALSE(transfer_status.ok());
-  ASSERT_THAT(transfer_status.status().error_message(),
+  ASSERT_THAT(transfer_status.status().message(),
               HasSubstr("was previously deallocated"));
 }
 
@@ -100,7 +99,7 @@ XLA_TEST_F(DeallocationTest, DeallocateTuple) {
 
   auto transfer_status = client_->Transfer(*global_data);
   ASSERT_FALSE(transfer_status.ok());
-  ASSERT_THAT(transfer_status.status().error_message(),
+  ASSERT_THAT(transfer_status.status().message(),
               HasSubstr("was previously deallocated"));
 }
 
@@ -116,7 +115,7 @@ XLA_TEST_F(DeallocationTest, DeallocateTupleWithRepeatedElements) {
 
   auto transfer_status = client_->Transfer(*global_data);
   ASSERT_FALSE(transfer_status.ok());
-  ASSERT_THAT(transfer_status.status().error_message(),
+  ASSERT_THAT(transfer_status.status().message(),
               HasSubstr("was previously deallocated"));
 }
 
@@ -132,7 +131,7 @@ XLA_TEST_F(DeallocationTest, DeallocateNestedTuple) {
 
   auto transfer_status = client_->Transfer(*global_data);
   ASSERT_FALSE(transfer_status.ok());
-  ASSERT_THAT(transfer_status.status().error_message(),
+  ASSERT_THAT(transfer_status.status().message(),
               HasSubstr("was previously deallocated"));
 }
 

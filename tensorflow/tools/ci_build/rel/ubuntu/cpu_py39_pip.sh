@@ -18,7 +18,6 @@ set -x
 
 source tensorflow/tools/ci_build/release/common.sh
 
-install_ubuntu_16_python_pip_deps python3.9
 # Update bazel
 install_bazelisk
 
@@ -36,7 +35,7 @@ export TF_BUILD_FLAGS="--config=release_cpu_linux"
 export TF_TEST_FLAGS="--define=no_tensorflow_py_deps=true --test_lang_filters=py --test_output=errors --verbose_failures=true --keep_going --test_env=TF2_BEHAVIOR=1"
 export TF_TEST_TARGETS="${DEFAULT_BAZEL_TARGETS} -//tensorflow/lite/... "
 export TF_PIP_TESTS="test_pip_virtualenv_non_clean test_pip_virtualenv_clean"
-export TF_TEST_FILTER_TAGS='-no_oss,-oss_serial,-no_oss_py39,-v1only'
+export TF_TEST_FILTER_TAGS='-no_oss,-oss_excluded,-oss_serial,-no_oss_py39,-v1only'
 #export IS_NIGHTLY=0 # Not nightly; uncomment if building from tf repo.
 export TF_PROJECT_NAME="tensorflow_cpu"
 export TF_PIP_TEST_ROOT="pip_test"

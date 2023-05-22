@@ -21,10 +21,10 @@ limitations under the License.
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "tensorflow/lite/context.h"
+#include "tensorflow/lite/core/model.h"
 #include "tensorflow/lite/kernels/kernel_util.h"
 #include "tensorflow/lite/kernels/subgraph_test_util.h"
 #include "tensorflow/lite/kernels/test_util.h"
-#include "tensorflow/lite/model.h"
 #include "tensorflow/lite/profiling/buffered_profiler.h"
 #include "tensorflow/lite/version.h"
 
@@ -113,7 +113,7 @@ TEST(ProfileSummarizerTest, Interpreter) {
   interpreter->SetProfiler(&profiler);
   profiler.StartProfiling();
   m.SetInputs(1, 2);
-  m.Invoke();
+  ASSERT_EQ(m.Invoke(), kTfLiteOk);
   // 3 = 1 + 2
   EXPECT_EQ(m.GetOutput(), 3);
   profiler.StopProfiling();
@@ -135,7 +135,7 @@ TEST(ProfileSummarizerTest, InterpreterPlusProfilingDetails) {
   interpreter->SetProfiler(&profiler);
   profiler.StartProfiling();
   m.SetInputs(1, 2);
-  m.Invoke();
+  ASSERT_EQ(m.Invoke(), kTfLiteOk);
   // 3 = 1 + 2
   EXPECT_EQ(m.GetOutput(), 3);
   profiler.StopProfiling();
@@ -154,7 +154,7 @@ TEST(ProfileSummarizerTest, InterpreterPlusProfilingDetails) {
 class ProfileSummarizerIfOpTest : public subgraph_test_util::ControlFlowOpTest {
  protected:
   void SetUp() override {
-    interpreter_->AddSubgraphs(2);
+    AddSubgraphs(2);
     builder_->BuildAddSubgraph(interpreter_->subgraph(1));
     builder_->BuildMulSubgraph(interpreter_->subgraph(2));
     builder_->BuildIfSubgraph(&interpreter_->primary_subgraph());

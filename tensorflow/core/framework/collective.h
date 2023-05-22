@@ -19,6 +19,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
+#include "tensorflow/core/framework/cancellation.h"
 #include "tensorflow/core/framework/device_attributes.pb.h"
 #include "tensorflow/core/framework/device_base.h"
 #include "tensorflow/core/framework/op_kernel.h"
@@ -29,7 +30,6 @@ limitations under the License.
 namespace tensorflow {
 
 class BufRendezvous;
-class CancellationManager;
 class CompleteGroupRequest;
 class CompleteGroupResponse;
 class CompleteInstanceRequest;
@@ -48,6 +48,7 @@ enum CollectiveType {
   GATHER_COLLECTIVE,
   PERMUTE_COLLECTIVE,
   ALL_TO_ALL_COLLECTIVE,
+  REDUCE_SCATTER_COLLECTIVE,
   UNDEFINED_COLLECTIVE,
 };
 
@@ -122,6 +123,8 @@ struct CollImplDetails {
 struct CollInstanceParams {
   // Identifies all participating graph nodes.
   int32 instance_key = -1;
+  // The full identifier includes both instance_key and step_id.
+  int64_t step_id = 0;
   CollectiveType type = UNDEFINED_COLLECTIVE;
   DataType data_type = DT_FLOAT;
   TensorShape shape = {0};
@@ -206,6 +209,10 @@ class ParamResolverInterface {
                                      CompleteInstanceResponse* response,
                                      CancellationManager* cancel_mgr,
                                      const StatusCallback& done) = 0;
+
+  // Looks up a group. It returns an error if the group is not ready or not
+  // found.
+  virtual Status LookupGroup(int32_t group_key, CollGroupParams* group) = 0;
 
   // Aborts the resolver. After abortion the resolver can no longer be used.
   virtual void StartAbort(const Status& s) = 0;
@@ -331,6 +338,10 @@ class CollectiveExecutor : public core::RefCounted {
                                   StatusCallback done) {
     return cem_->GetParamResolver()->CompleteGroupAsync(device, group_params,
                                                         cancel_mgr, done);
+  }
+
+  virtual Status LookupGroup(int32_t group_key, CollGroupParams* group) {
+    return cem_->GetParamResolver()->LookupGroup(group_key, group);
   }
 
   // Runs the potentially-blocking closure/expensive callback.

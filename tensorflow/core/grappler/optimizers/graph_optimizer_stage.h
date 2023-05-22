@@ -150,7 +150,7 @@ class GraphOptimizerStage {
   // (TrySimplify), and make virtual implementation protected.
   Status EnsureNodeIsSupported(const NodeDef* node) const {
     return IsSupported(node)
-               ? Status::OK()
+               ? OkStatus()
                : errors::InvalidArgument(
                      "Node ", node->name(), " is not supported by optimizer ",
                      optimizer_name_, " and stage ", stage_name_);
@@ -263,8 +263,7 @@ class GraphOptimizerStagePipeline {
         if (!stage_status.ok()) {
           VLOG(2) << "Failed to run optimizer " << stage->optimizer_name()
                   << ", stage " << stage->stage_name() << " node "
-                  << node->name()
-                  << ". Error: " << stage_status.error_message();
+                  << node->name() << ". Error: " << stage_status.message();
         }
         if (break_predicate_(*result)) return true;
       }
@@ -275,7 +274,7 @@ class GraphOptimizerStagePipeline {
   // Pass a node through all registered optimizer stages, until break predicate
   // is true or a stage fails.
   //
-  // Returns any stage failure status, or else Status::OK().
+  // Returns any stage failure status, or else OkStatus().
   Status PassThroughAllStagesWithStatus(NodeDef* node, Result* result) {
     for (auto& stage : stages_) {
       if (!stage->IsSupported(node)) {
@@ -288,7 +287,7 @@ class GraphOptimizerStagePipeline {
         break;
       }
     }
-    return Status::OK();
+    return OkStatus();
   }
 
   std::size_t NumStages() { return stages_.size(); }

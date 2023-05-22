@@ -88,23 +88,11 @@ bool inline DoesControlEdgeExist(const Node* src, const Node* dst) {
   return false;
 }
 
-// Check if graph should run in layout-dependent mode or native format mode
-// based on environment variable setting. Native format mode is default. User
-// can set TF_ENABLE_MKL_NATIVE_FORMAT=0 to disable the native format mode.
-bool inline NativeFormatEnabled() {
-#ifndef ENABLE_MKL
-  return true;
-#else
-  static bool native_fmt_enabled = true;
-  static absl::once_flag once;
-  absl::call_once(once, [&] {
-    TF_CHECK_OK(ReadBoolFromEnvVar("TF_ENABLE_MKL_NATIVE_FORMAT",
-                                   /*default_value*/ true,
-                                   &native_fmt_enabled));
-  });
-  return native_fmt_enabled;
-#endif
-}
+// In TF 2.8, oneDNN blocked format will not be supported.
+// TODO(intel_tf): Cleanup shall be done in future:
+//                 (1) Remove this method;
+//                 (2) Update related code wherever it is called.
+bool inline NativeFormatEnabled() { return true; }
 
 // Check if the data_format attribute in the node def represents 5D tensor
 bool inline Check5DFormat(const NodeDef& ndef) {
@@ -158,7 +146,8 @@ inline string GetMklNativeOpName(const string& name) {
        0 == name.compare("BatchMatMul") || 0 == name.compare("BatchMatMulV2") ||
        0 == name.compare("Einsum") || 0 == name.compare("MatMul") ||
        0 == name.compare("Transpose") || 0 == name.compare("QuantizeV2") ||
-       0 == name.compare("Dequantize") || 0 == name.rfind("Quantized", 0));
+       0 == name.compare("Dequantize") || 0 == name.compare("Softmax") ||
+       0 == name.rfind("Quantized", 0));
 
   if (result) {
     return string(kMklOpPrefix) + name;
@@ -259,8 +248,8 @@ static inline bool IsMklOp(const string& op_name, DataType T,
   return kernel_registered;
 }
 
-// TODO(mdfaijul): QuantizedConv2D is registered with input: QUINT8
-// filter:QINT8 for mkldnn integration. First a dummy kernel is created
+// TODO(intel-tf): QuantizedConv2D is registered with input: QUINT8
+// filter:QINT8 for oneDNN integration. First a dummy kernel is created
 // and then it is replaced by an actual kernel.
 static inline bool IsMklQuantizedOp(const string& op_name, DataType Tinput,
                                     DataType Tfilter) {

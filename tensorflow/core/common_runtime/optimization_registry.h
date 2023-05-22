@@ -74,6 +74,14 @@ struct GraphOptimizationPassOptions {
   // derived. `graph` doesn't contain all the information in the function_def,
   // e.g. function attributes.
   const FunctionDef* function_def = nullptr;
+
+  // TODO(b/176491312): Remove this if shape inference on import flag is
+  // removed. If True, allows mlir roundtrip to run shape inference on import.
+  bool shape_inference_on_tfe_dialect_import = true;
+
+  // A unique filename prefix (using hostname, process ID, thread ID and
+  // timestamp) for graph dumps.
+  string debug_filename_prefix;
 };
 
 // Optimization passes are implemented by inheriting from
@@ -129,6 +137,20 @@ class OptimizationPassRegistry {
 
  private:
   std::map<Grouping, GraphOptimizationPasses> groups_;
+
+  const char* GetGroupingName(Grouping grouping) const {
+    switch (grouping) {
+      case PRE_PLACEMENT:
+        return "pre_placement";
+      case POST_PLACEMENT:
+        return "post_placement";
+      case POST_REWRITE_FOR_EXEC:
+        return "post_rewrite_for_exec";
+      case POST_PARTITIONING:
+        return "post_partitioning";
+    }
+    return "unknown";
+  }
 };
 
 namespace optimization_registration {

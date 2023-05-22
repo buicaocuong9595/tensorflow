@@ -15,14 +15,13 @@
 
 # A list of assignees
 assignees:
+   - synandi
+   - SuryanarayanaY
    - tilakrayal
-   - sushreebarsa
-   - Mohantym
 # A list of assignees for compiler folder
 compiler_assignees:
    - joker-eph
    - sanjoy
-   - sherhut
 # filesystem path
 filesystem_path:
    - tensorflow/c/experimental/filesystem

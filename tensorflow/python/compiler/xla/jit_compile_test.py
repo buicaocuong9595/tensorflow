@@ -20,6 +20,7 @@ from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import errors
 from tensorflow.python.framework import ops
 from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import string_ops
 from tensorflow.python.platform import test
 
 
@@ -60,7 +61,7 @@ class JitCompileTest(test.TestCase):
 
       # Check that the must-compile attribute gets correctly propagated to the
       # created derivatives.
-      self.assertTrue(forward.definition.attr["_XlaMustCompile"])
+      self.assertTrue(forward.cached_definition.attr["_XlaMustCompile"])
       self.assertTrue(backward.function_def.attr["_XlaMustCompile"])
 
   def testBasicInt32(self):
@@ -84,7 +85,8 @@ class JitCompileTest(test.TestCase):
     with ops.Graph().as_default() as g:
 
       def fn(x):
-        return array_ops.unique(x).y  # Unique is not supported by XLA
+        return string_ops.string_length(
+            string_ops.string_format('{}', x))
 
       xla_func = def_function.function(fn, jit_compile=True)
       inputs = array_ops.placeholder(dtypes.float32, [5])

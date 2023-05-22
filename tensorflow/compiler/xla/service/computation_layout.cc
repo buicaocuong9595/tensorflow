@@ -16,11 +16,13 @@ limitations under the License.
 #include "tensorflow/compiler/xla/service/computation_layout.h"
 
 #include <algorithm>
+#include <string>
+#include <utility>
 
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
+#include "tensorflow/compiler/xla/printer.h"
 #include "tensorflow/compiler/xla/types.h"
-#include "tensorflow/core/lib/hash/hash.h"
 
 namespace xla {
 
@@ -61,13 +63,27 @@ bool ComputationLayout::LayoutIsSet() const {
          result_layout_.LayoutIsSet();
 }
 
-string ComputationLayout::ToString() const {
-  std::vector<string> params;
-  for (auto& param_layout : parameter_layouts_) {
-    params.push_back(param_layout.ToString());
+void ComputationLayout::Print(Printer* printer) const {
+  printer->Append("(");
+  if (!parameter_layouts_.empty()) {
+    parameter_layouts_[0].Print(printer);
+    for (int i = 1; i < parameter_layouts_.size(); ++i) {
+      if (i % 5 == 0) {
+        printer->Append(absl::StrFormat(", /*index=%lld*/", i));
+      } else {
+        printer->Append(", ");
+      }
+      parameter_layouts_[i].Print(printer);
+    }
   }
-  return absl::StrCat("(", absl::StrJoin(params, ", "), ") => ",
-                      result_layout_.ToString());
+  printer->Append(")->");
+  result_layout_.Print(printer);
+}
+
+std::string ComputationLayout::ToString() const {
+  StringPrinter printer;
+  Print(&printer);
+  return std::move(printer).ToString();
 }
 
 ProgramShape ComputationLayout::ComputeProgramShape() const {
@@ -88,15 +104,6 @@ bool ComputationLayout::operator==(const ComputationLayout& other) const {
 bool ComputationLayout::operator!=(const ComputationLayout& other) const {
   return result_layout() != other.result_layout() ||
          parameter_layouts() != other.parameter_layouts();
-}
-
-uint64 ComputationLayout::Hash() const {
-  uint64 hash_value = ShapeUtil::Hash(result_layout_.shape());
-  for (const auto& parameter_layout : parameter_layouts_) {
-    hash_value = tensorflow::Hash64Combine(
-        hash_value, ShapeUtil::Hash(parameter_layout.shape()));
-  }
-  return hash_value;
 }
 
 }  // namespace xla

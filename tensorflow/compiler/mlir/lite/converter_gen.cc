@@ -15,6 +15,7 @@ limitations under the License.
 
 #include <assert.h>
 
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -109,6 +110,7 @@ static void EmitOptionBuilders(const RecordKeeper &record_keeper,
     SmallVector<std::string, 8> options;
     // Add options due to attributes (not-derived).
     auto *arg_values = def->getValueAsDag("arguments");
+    mlir::tblgen::Operator op(*def);
     for (unsigned i = 0, e = arg_values->getNumArgs(); i != e; ++i) {
       auto arg = arg_values->getArg(i);
       DefInit *arg_def = dyn_cast<DefInit>(arg);
@@ -130,8 +132,9 @@ static void EmitOptionBuilders(const RecordKeeper &record_keeper,
         if (IsLstmOp(op_name) && arg_name.take_back(12) == "intermediate")
           continue;
         os << formatv(
-            "  auto {0} = Convert{1}ForOptionWriter(op.{0}(), fbb);\n",
-            arg_name, mlir::tblgen::Attribute(arg_def).getAttrDefName());
+            "  auto {0} = Convert{1}ForOptionWriter(op.{2}(), fbb);\n",
+            arg_name, mlir::tblgen::Attribute(arg_def).getAttrDefName(),
+            op.getGetterName(arg_name));
         options.push_back(arg_name.str());
       }
     }
@@ -146,8 +149,9 @@ static void EmitOptionBuilders(const RecordKeeper &record_keeper,
                 "unsupported attribute modelling, only single class expected");
           }
           os << formatv(
-              "  auto {0} = Convert{1}ForOptionWriter(op.{0}(), fbb);\n",
-              val.getName(), record->getClasses()[0]->getName());
+              "  auto {0} = Convert{1}ForOptionWriter(op.{2}(), fbb);\n",
+              val.getName(), record->getClasses()[0]->getName(),
+              op.getGetterName(val.getName()));
           options.push_back(std::string(val.getName()));
         }
       }
@@ -227,7 +231,7 @@ static inline std::string GetOperatorName(const Record &def) {
 //
 // The signature of the function is:
 //
-//   llvm::Optional<tflite::BuiltinOperator>
+//   std::optional<tflite::BuiltinOperator>
 //   mlir::GetBuiltinOpCode(mlir::Operation* op);
 //
 // TODO(hinsu): Consider converting this to a static constant associative
@@ -236,7 +240,7 @@ static void EmitGetBuiltinOpCode(const std::vector<Record *> &defs,
                                  raw_ostream *ostream) {
   raw_ostream &os = *ostream;
 
-  os << "llvm::Optional<tflite::BuiltinOperator> "
+  os << "std::optional<tflite::BuiltinOperator> "
         "mlir::GetBuiltinOpCode(mlir::Operation* op) {\n";
 
   for (const auto *def : defs) {
@@ -246,7 +250,7 @@ static void EmitGetBuiltinOpCode(const std::vector<Record *> &defs,
        << "    return tflite::BuiltinOperator_" << operator_name << ";\n";
   }
 
-  os << "  return llvm::None;\n"
+  os << "  return std::nullopt;\n"
         "}\n";
 }
 
@@ -299,7 +303,7 @@ static void EmitOperandNumbers(const RecordKeeper &record_keeper,
 //
 // The signature of the function is:
 //
-//   llvm::Optional<Flatbuffers::Offset<tflite::Operator>>
+//   std::optional<Flatbuffers::Offset<tflite::Operator>>
 //   mlir::CreateFlatBufferOperator(
 //       mlir::Operation* op,
 //       uint32_t opcode_index,
@@ -312,7 +316,7 @@ static void EmitBuildOperator(const std::vector<Record *> &defs,
   raw_ostream &os = *ostream;
 
   // Signature
-  os << "llvm::Optional<flatbuffers::Offset<tflite::Operator>>\n"
+  os << "std::optional<flatbuffers::Offset<tflite::Operator>>\n"
         "mlir::CreateFlatBufferOperator(mlir::Operation* op, "
         "uint32_t opcode_index, "
         "const std::vector<int32_t>& operands,"
@@ -332,7 +336,7 @@ static void EmitBuildOperator(const std::vector<Record *> &defs,
        << "fbb);\n";
   }
 
-  os << "  return llvm::None;\n"
+  os << "  return std::nullopt;\n"
         "}\n";
 }
 
@@ -436,7 +440,7 @@ static void GenOperandResultVerifier(raw_ostream &os,
   mlir::tblgen::FmtContext fctx;
 
   bool first = true;
-  for (auto static_value : llvm::enumerate(values)) {
+  for (const auto &static_value : llvm::enumerate(values)) {
     auto *definit = llvm::cast<llvm::DefInit>(static_value.value());
     auto *val = definit->getDef()->getValue("tflRuntimeTypePredicate");
     if (!val) continue;
@@ -461,10 +465,14 @@ static void GenOperandResultVerifier(raw_ostream &os,
     os << "      (void)v;\n"
        << "      if (!("
        << tgfmt(pred.getCondition(), &fctx.withSelf("v.getType()")) << ")) {\n"
+       << "        if (emit_error_on_verify_fail) {\n"
        << formatv(
-              "      return op->emitOpError(\"{0} #\") << index "
+              "        return op->emitOpError(\"{0} #\") << index "
               "<< \" must be {1}, but got \" << v.getType();\n",
               valueKind, desc)
+       << "        } else {\n"
+       << "          return failure();\n"
+       << "        }\n"
        << "      }\n"  // if
        << "      ++index;\n"
        << "    }\n";  // for
@@ -489,9 +497,10 @@ static bool RuntimeVerifierWriterMain(raw_ostream &os, RecordKeeper &records) {
 
     mlir::tblgen::FmtContext verify_ctx;
     os << "::mlir::LogicalResult " << op.getCppClassName()
-       << "::VerifyTflRuntimeConstraints(::mlir::Operation *op) {\n";
+       << "::VerifyTflRuntimeConstraints(::mlir::Operation *op, bool "
+          "emit_error_on_verify_fail) {\n";
     os << "  auto top = cast<" << op.getCppClassName() << ">(op); (void)top;\n";
-    verify_ctx.withOp("top");
+    verify_ctx.addSubst("_op", "top");
 
     for (int i = 0, e = op.getNumOperands(); i < e; ++i) {
       auto &value = op.getOperand(i);
@@ -530,11 +539,37 @@ static bool RuntimeVerifierWriterMain(raw_ostream &os, RecordKeeper &records) {
 
       mlir::tblgen::Pred pred(dyn_cast<llvm::DefInit>(val->getValue()));
       os << tgfmt(
-          "  if (!($0))\n"
-          "    return top.emitOpError(\"failed to verify that $1\");\n",
+          "  if (!($0)) {\n    "
+          "    if (emit_error_on_verify_fail) {\n"
+          "      return top.emitOpError(\"failed to verify that $1\");\n"
+          "    } else {\n"
+          "      return failure();\n  }\n  }\n",
           &verify_ctx, tgfmt(pred.getCondition(), &verify_ctx), desc);
     }
-    os << "  return top.verify();\n}\n";
+    os << "    if (!emit_error_on_verify_fail) {\n";
+    os << "// Ignore transient errors by registering an no-op handler.\n"
+          "// Applying legalization patterns will emit unwanted, transient \n"
+          "// errors when the replaced TFLite ops do not meet the sanity \n"
+          "// checks. \n"
+          "// In order to ignore the transient errors, the following lines \n"
+          "// override a diagnostic handler with an no-op handler only\n"
+          "// while this pass runs.\n"
+          "uint64_t current_thread_id = llvm::get_threadid();\n"
+          "ScopedDiagnosticHandler scoped_diag_handler(\n"
+          "      top.getContext(), [&current_thread_id](Diagnostic&) -> "
+          "LogicalResult "
+          "{\n"
+          "        // Consume only errors that are coming from the same thread "
+          "in order not\n"
+          "  // to ignore errors from other passes that are running. Things\n"
+          "         // running\n"
+          "     // in the pass manager can be multi-threaded.\n"
+          "        return success(current_thread_id == llvm::get_threadid());\n"
+          "   });\n";
+    os << "  return top.verifyInvariants();\n";
+    os << "    } else {\n";
+    os << "  return top.verifyInvariants();\n}\n";
+    os << "}\n";
   }
 
   return false;

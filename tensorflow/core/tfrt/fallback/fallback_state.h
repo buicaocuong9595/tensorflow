@@ -24,7 +24,6 @@ limitations under the License.
 #include "tensorflow/core/framework/device.h"
 #include "tensorflow/core/framework/graph.pb.h"
 #include "tensorflow/core/public/session_options.h"
-#include "tensorflow/core/tfrt/utils/statusor.h"
 
 namespace tensorflow {
 namespace tfrt_stub {
@@ -39,6 +38,10 @@ class FallbackState {
       const SessionOptions &session_options,
       const tensorflow::FunctionDefLibrary &fdef_lib);
 
+  static StatusOr<std::unique_ptr<FallbackState>> CreateWithCpuDevice(
+      const SessionOptions &session_options,
+      const tensorflow::FunctionDefLibrary &fdef_lib);
+
   FallbackState(const SessionOptions &session_options,
                 std::vector<std::unique_ptr<Device>> devices,
                 const tensorflow::FunctionDefLibrary &fdef_lib);
@@ -46,11 +49,16 @@ class FallbackState {
   // Create GraphExecutionState from the `graph_def`. The result will contain a
   // preprocessed graph with runtime information such as devices.
   StatusOr<std::unique_ptr<GraphExecutionState>> CreateGraphExecutionState(
-      GraphDef graph_def) const;
+      GraphDef graph_def, bool run_placer = true) const;
+
+  // Adds `func_def` to the function library.
+  Status AddFunctionDef(const FunctionDef &func_def);
 
   const SessionOptions &session_options() const { return session_options_; }
 
   const DeviceMgr &device_manager() const { return device_manager_; }
+
+  const DeviceSet &device_set() const { return device_set_; }
 
   const ProcessFunctionLibraryRuntime &process_function_library_runtime()
       const {

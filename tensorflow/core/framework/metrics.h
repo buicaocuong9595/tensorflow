@@ -12,9 +12,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-
 #ifndef TENSORFLOW_CORE_FRAMEWORK_METRICS_H_
 #define TENSORFLOW_CORE_FRAMEWORK_METRICS_H_
+
+#include <cstdint>
 
 #include "absl/container/flat_hash_map.h"
 #include "tensorflow/core/framework/dataset_options.pb.h"
@@ -23,9 +24,21 @@ limitations under the License.
 #include "tensorflow/core/platform/env.h"
 #include "tensorflow/core/platform/statusor.h"
 #include "tensorflow/core/platform/types.h"
+#include "tensorflow/core/protobuf/data_service.pb.h"
+#include "tensorflow/core/protobuf/meta_graph.pb.h"
 
 namespace tensorflow {
 namespace metrics {
+enum class GraphOptimizationSource {
+  kUnknown,
+  kJit,
+  kAot,
+};
+
+// Records when a data-fetching tf.data operation is executed.
+//
+// The `name` argument identifies the operation type (e.g. "ToSingleElementOp").
+void RecordTFDataFetchOp(const string& name);
 
 // Records that a tf.data.Dataset executed by the program used autotuning.
 //
@@ -74,6 +87,14 @@ void RecordTFDataExperiment(const string& name);
 // `ItertatorResource::GetNext()`.
 void RecordTFDataGetNextDuration(uint64 duration_us);
 
+// Records the histogram of ratios of tf.data autotune algorithm used RAM over
+// the ram budget.
+void RecordTFDataAutotuneUsedRamBudgetRatio(const double ratio);
+
+// Records the histogram of ratios of tf.data autotune algorithm max buffer
+// bytes over the ram budget.
+void RecordTFDataAutotuneMaxBufferBudgetRatio(const double ratio);
+
 // Records the number of times each tf.data fingerprint is used
 // to measure duplicate pre-processing.
 //
@@ -89,6 +110,11 @@ void RecordTFDataIteratorBusy(uint64 duration_us);
 // first `GetNext()` request and responding to the last `GetNext()` request.
 void RecordTFDataIteratorLifetime(uint64 duration_us);
 
+// Records the time histogram (in microseconds) between `IteratorResource`
+// responding to a `GetNext()` request and receiving the next `GetNext()`
+// request.
+void RecordTFDataIteratorGap(uint64 duration_us);
+
 // Records the number of independent graph changes resulting from the
 // application of a tf.data optimization.
 //
@@ -97,6 +123,44 @@ void RecordTFDataOptimization(const string& name, int64_t num_changes);
 
 // Records that a tf.data service worker has been created.
 void RecordTFDataServiceWorkerCreated();
+
+// Records that a tf.data service job has been created.
+void RecordTFDataServiceJobsCreated(
+    const data::ProcessingModeDef& processing_mode, bool is_coordinated_read);
+
+// Records tf.data service iterators created by clients.
+void RecordTFDataServiceClientIterators(
+    int64_t worker_uid, data::DeploymentMode deployment_mode,
+    const data::ProcessingModeDef& processing_mode, bool is_coordinated_read);
+
+// Records that a tf.data service worker client has been created that will use
+// `data_transfer_protocol` to get data from the worker server and whether or
+// not the user explicitly specified the protocol.
+void RecordTFDataServiceDataTransferProtocolUsed(
+    const string& data_transfer_protocol, bool user_specified);
+
+// Records that a tf.data service worker client fell back to gRPC rather than
+// use `data_transfer_protocol` because of an error of type `code` with message
+// `error_message`.
+void RecordTFDataServiceDataTransferProtocolFallback(
+    const string& data_transfer_protocol, error::Code code,
+    const string& error_message);
+
+// Records that a tf.data service worker client got an error of non-retriable
+// type `code` with message `error_message` when trying to transfer data over
+// `data_transfer_protocol`.
+void RecordTFDataServiceDataTransferProtocolError(
+    const string& data_transfer_protocol, error::Code code,
+    const string& error_message);
+
+// Records tf.data service cross-trainer cache queries.
+void RecordTFDataServiceCrossTrainerCacheQuery(bool cache_hit);
+
+// Records tf.data service cross-trainer cache memory usage in bytes.
+void RecordTFDataServiceCrossTrainerCacheSizeBytes(size_t bytes);
+
+// Records distributed tf.data snapshot bytes committed.
+void RecordTFDataServiceSnapshotBytesCommitted(int64_t bytes);
 
 // Records the file name read by a tf.data Dataset.
 //
@@ -119,6 +183,10 @@ void RecordTFDataAutoShard(const string& id, data::AutoShardPolicy policy,
 // `ineligible_reason` is the reason if the input pipeline is ineligible.
 void RecordTFDataAutoShardRewriteBatchSize(
     bool eligible, const std::vector<string>& ineligible_reason);
+
+// Records the number of times each tf.data autotuning algorithm stopping
+// criterion is met.
+void RecordTFDataAutotuneStoppingCriteria(const string& name);
 
 // Records parsing of dense tensor features.
 void RecordParseDenseFeature(int64_t num_features);
@@ -157,6 +225,84 @@ void RecordUnusedOutput(const string& op_name);
 // TODO(jtkeeling): Should we record building/optimizing tf.functions?
 void UpdateGraphBuildTime(const uint64 running_time_usecs);
 
+// Updates the metric stored for time spent optimizing function graphs.
+void UpdateFunctionGraphOptimizationTime(const uint64 running_time_usecs);
+
+// Updates the metric stored for time saved by caching graph optimization.
+void UpdateFunctionGraphOptimizationSavingTime(uint64 saving_time_usec,
+                                               GraphOptimizationSource source);
+
+// Retrieves the total time saved by the graph optimization caching.
+uint64 GetFunctionGraphOptimizationSavingTimeUsecs(
+    GraphOptimizationSource source);
+
+// Increments the hit count for the graph optimization cache.
+void IncrementFunctionGraphOptimizationCacheHitCount(
+    int count, GraphOptimizationSource source);
+
+// Gets the hit count for the graph optimization cache.
+int64_t GetFunctionGraphOptimizationCacheHitCount(
+    GraphOptimizationSource source);
+
+// Increments the failure count for the graph optimization cache restoring.
+void IncrementFunctionGraphOptimizationCacheFailureCount(
+    int count, GraphOptimizationSource source);
+
+// Gets the failure count for the graph optimization cache.
+int64_t GetFunctionGraphOptimizationCacheFailureCount(
+    GraphOptimizationSource source);
+
+// Increments the miss count for the graph optimization cache.
+void IncrementFunctionGraphOptimizationCacheMissCount(
+    int count, GraphOptimizationSource source);
+
+// Gets the miss count for the graph optimization cache.
+int64_t GetFunctionGraphOptimizationCacheMissCount(
+    GraphOptimizationSource source);
+
+// Increments the number of restoring function graph optimization cache.
+void IncrementFunctionGraphOptimizationCacheLoadCount(
+    int count, GraphOptimizationSource source);
+
+int64_t GetFunctionGraphOptimizationCacheLoadCount(
+    GraphOptimizationSource source);
+
+// Records the activity of the first phase of the mlir bridge using the
+// tf_metadata.tf_mlir_bridge_first_phase_count metric.
+// device_type: tpu, cpu, gpu, etc.
+// bridge_version: v1 compat, v2, etc.
+// fallback_enabled: true if fallback will happen, false if not
+// result: outcome of bridge (success, failure, disabled, invalid_graph, etc.)
+void UpdateTfMlirBridgeFirstPhaseCounter(const std::string& device_type,
+                                         const std::string& bridge_version,
+                                         bool fallback_enabled,
+                                         const std::string& result);
+
+// Records the activity per op using the
+// tf_metadata.tf_mlir_bridge_graph_analysis_per_op.
+// op_name: the name of op.
+// construction_context: eager, session, Not tracked.
+// is_single_core_inference_mode: true, false.
+// unsupported_reason: the reason why the graph is not supported in MLIR-based
+// bridge, like invalid graph, has unsupported ops, etc.
+// has_unsupported_features: true indicates MLIR-based bridge is disabled,
+// false indicates MLIR-based bridge is enabled.
+
+void UpdateTfMlirBridgeGraphAnalysisPerOp(
+    const std::string& op_name, const std::string& construction_context,
+    bool is_single_core_inference_mode, const std::string& num_replicas,
+    const std::string& num_cores_per_replica, const std::string& use_tpu,
+    const std::string& allow_soft_placement,
+    const std::string& use_spmd_for_xla_partitioning,
+    const std::string& unsupported_reason, bool has_unsupported_features);
+
+// Records whether a graph contains any of the TF1 features
+void RecordTFVersionByGraphFeatures(const std::string& device,
+                                    const std::string& context,
+                                    bool hasControlFlowV1,
+                                    bool hasReferenceVariables,
+                                    bool hasManualControlDeps);
+
 // Convenience class allowing RAII style of reporting for a monitoring::Counter.
 template <int NumLabels>
 class ScopedCounter final {
@@ -185,44 +331,60 @@ class ScopedCounter final {
   // Start the measurement with the existing set of labels.
   void Reset() { Init(); }
 
+  // Returns duration of the current interval in case the timer has started.
+  // Returns nullopt otherwise.
+  std::optional<uint64> DurationMicroSec() const {
+    return started_ ? std::optional<uint64>(accumulated_time_ +
+                                            Env::Default()->NowMicros() -
+                                            start_time_)
+                    : std::nullopt;
+  }
+
+  // Temporarily stop the timer, but keep accumulated time.
+  void AccumulateAndStop() {
+    if (started_) {
+      accumulated_time_ = Env::Default()->NowMicros() - start_time_;
+      started_ = false;
+    }
+  }
+
+  // Start previously stopped timer.
+  void Start() {
+    if (started_) return;
+
+    // Keep previously accumulated time if any.
+    start_time_ = Env::Default()->NowMicros();
+    started_ = true;
+  }
+
   ~ScopedCounter() { ReportAndStop(); }
 
  private:
   template <std::size_t... S>
   void ReportInternal(std::index_sequence<S...>) {
-    uint64 time_interval =
-        tensorflow::Env::Default()->NowMicros() - start_time_;
+    uint64 time_interval = Env::Default()->NowMicros() - start_time_;
+    time_interval += accumulated_time_;
     if (time_interval > 0) {
       counter_->GetCell(labels_[S]...)->IncrementBy(time_interval);
     }
   }
 
   void Init() {
-    start_time_ = tensorflow::Env::Default()->NowMicros();
+    start_time_ = Env::Default()->NowMicros();
     started_ = true;
+    accumulated_time_ = 0;
   }
 
   monitoring::Counter<NumLabels>* counter_;
   std::array<std::string, NumLabels> labels_;
   bool started_{false};
   uint64 start_time_;
+  uint64 accumulated_time_;
 };
 
 // Returns a counter used to capture timing metrics for graph optimization
 // passes.
 monitoring::Counter<2>* GetGraphOptimizationCounter();
-
-// Updates the metrics stored about graph optimizations.
-void UpdateGraphOptimizationPassTime(const string& pass_name,
-                                     const uint64 running_time_usecs);
-void UpdateGrapplerPassTime(const string& pass_name,
-                            const uint64 running_time_usecs);
-void UpdateMlirGraphOptimizationPassTime(const string& pass_name,
-                                         const uint64 running_time_usecs);
-void UpdateTFDataPassTime(const string& pass_name,
-                          const uint64 running_time_usecs);
-void UpdateGraphOptimizerPassTime(const string& pass_name,
-                                  const uint64 running_time_usecs);
 
 // Updates metrics for time to distribute variables to all TPU hosts.
 void UpdateTpuVariableDistributionTime(const uint64 distribution_time_usecs);
@@ -230,8 +392,27 @@ void UpdateTpuVariableDistributionTime(const uint64 distribution_time_usecs);
 // Updates the metrics stored about time XLA spents compiling graphs.
 void UpdateXlaCompilationTime(const uint64 compilation_time_usecs);
 
-// Updates the metrics stored about time BFC allocator spents during delay.
-void UpdateBfcAllocatorDelayTime(const uint64 delay_usecs);
+// Increments (by 1) a simple integer counter that is exposed for testing.
+void IncrementTestCounter(const string& name, const string& label);
+
+// Read-only access to a counter for testing.
+const monitoring::CounterCell* TestCounter(const string& name,
+                                           const string& label);
+
+// Read-only wrapper for a TestCounter to track increments between calls.
+class TestDelta {
+ public:
+  TestDelta(const string& name, const string& label);
+  void Reset();
+  int64 Get();
+
+ private:
+  const monitoring::CounterCell* cell_;
+  int64 last_value_;
+};
+void UpdateTpuErrorCounter(const string& op, const string& error_type);
+void UpdateEagerClientErrorCounter(const string& error_source,
+                                   const string& error_type);
 
 }  // namespace metrics
 }  // namespace tensorflow

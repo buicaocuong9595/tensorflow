@@ -15,62 +15,117 @@ limitations under the License.
 
 #include "tensorflow/compiler/xla/service/gpu/nccl_all_to_all_thunk.h"
 
-#include <chrono>  // NOLINT (required by TF interfaces)
 #include <cstdlib>
-#include <memory>
-#include <string>
+#include <optional>
 #include <utility>
 #include <vector>
 
-#include "absl/strings/str_format.h"
-#include "absl/types/optional.h"
-#include "tensorflow/compiler/xla/layout_util.h"
 #include "tensorflow/compiler/xla/service/gpu/ir_emission_utils.h"
-#include "tensorflow/compiler/xla/service/hlo_casting_utils.h"
-#include "tensorflow/compiler/xla/service/hlo_instructions.h"
+#include "tensorflow/compiler/xla/service/gpu/nccl_collective_thunk.h"
 #include "tensorflow/compiler/xla/shape_util.h"
-#include "tensorflow/compiler/xla/util.h"
+
+#if XLA_ENABLE_XCCL
+#include "tensorflow/compiler/xla/stream_executor/gpu/gpu_stream.h"
+#endif
 
 namespace xla {
 namespace gpu {
 
-/*static*/ NcclAllToAllConfig NcclAllToAllThunk::GetNcclAllToAllConfig(
-    mlir::lmhlo::AllToAllOp op) {
+namespace impl {
+template <typename OpT>
+NcclAllToAllConfig GetNcclAllToAllConfig(OpT op) {
   NcclAllToAllConfig config;
   // FIXME(b/180174349): LMHLO AllToAll incorrectly has use_global_device_ids
   // attribute and it should be removed.
-  config.config = GetNcclCollectiveConfigForMlir(op, absl::nullopt);
-  config.has_split_dimension = op.split_dimension().hasValue();
+  config.config = GetNcclCollectiveConfigForMlir(op, std::nullopt);
+  config.has_split_dimension = op.getSplitDimension().has_value();
   return config;
 }
 
-/*static*/ bool NcclAllToAllThunk::CanImplement(mlir::lmhlo::AllToAllOp op) {
-  return absl::c_all_of(op.operands(), [&op](mlir::Value operand) {
+template <typename OpT>
+Status CheckImplementable(OpT op) {
+  TF_RETURN_IF_ERROR(NcclCollectiveThunk::CheckImplementable());
+  std::optional<uint64_t> split_dim = op.getSplitDimension();
+  for (mlir::Value operand : op.getInputs()) {
+    TF_RETURN_IF_ERROR(IsValidOperand(operand, Thunk::kNcclAllToAll));
     Shape shape = GetShape(operand);
-    return LayoutUtil::IsDenseArray(shape) &&
-           IsTypeSupportedByNccl(shape.element_type()) &&
-           (!op.split_dimension() ||
-            LayoutUtil::MinorToMajor(shape).back() == *op.split_dimension());
-  });
+    if (split_dim &&
+        !ShapeUtil::IsEffectivelyMostMajorDimension(shape, *split_dim)) {
+      return tsl::errors::Unimplemented(
+          "all-to-all split dim %u is not the most major in input shape %s",
+          *split_dim, shape.ToString(/*print_layout=*/true));
+    }
+  }
+  return OkStatus();
 }
+}  // namespace impl
 
-NcclAllToAllThunk::NcclAllToAllThunk(
-    ThunkInfo thunk_info, mlir::lmhlo::AllToAllOp op,
-    std::vector<NcclAllToAllThunk::Buffer> buffers)
-    : NcclCollectiveThunk(Thunk::kNcclAllToAll, thunk_info),
-      config_(GetNcclAllToAllConfig(op)),
+NcclAllToAllThunkBase::NcclAllToAllThunkBase(Kind kind, ThunkInfo thunk_info,
+                                             NcclAllToAllConfig config,
+                                             std::vector<Buffer> buffers)
+    : NcclCollectiveThunk(kind, thunk_info),
+      config_(std::move(config)),
       buffers_(std::move(buffers)) {
   CHECK_EQ(config_.config.operand_count, buffers_.size());
 }
 
-Status NcclAllToAllThunk::RunNcclCollective(const ExecuteParams& params,
-                                            ncclComm_t comm) {
+Status NcclAllToAllThunkBase::RunAllToAll(const ExecuteParams& params,
+                                          se::Stream& stream, ncclComm_t comm) {
+  TF_ASSIGN_OR_RETURN(
+      std::vector<DeviceBufferPair> device_buffers,
+      ConvertToDeviceBuffers(params, buffers_,
+                             config_.config.operand_element_type));
+  return xla::gpu::RunAllToAll(config_.has_split_dimension, device_buffers,
+                               stream, comm);
+}
+
+NcclAllToAllStartThunk::NcclAllToAllStartThunk(
+    ThunkInfo thunk_info, mlir::lmhlo_gpu::AllToAllStartOp op,
+    std::vector<NcclCollectiveThunk::Buffer> buffers)
+    : NcclAllToAllThunkBase(Thunk::kNcclAllToAllStart, thunk_info,
+                            impl::GetNcclAllToAllConfig(op),
+                            std::move(buffers)) {}
+
+/*static*/ Status NcclAllToAllStartThunk::CheckImplementable(
+    mlir::lmhlo_gpu::AllToAllStartOp op, int64_t replica_count,
+    int64_t partition_count) {
+  return AddOpDescription<NcclAllToAllStartThunk>(
+      impl::CheckImplementable(op), op, replica_count, partition_count);
+}
+
+/*static*/ bool NcclAllToAllStartThunk::IsDegenerate(
+    mlir::lmhlo_gpu::AllToAllStartOp op, int64_t replica_count,
+    int64_t partition_count) {
+  return impl::GetNcclAllToAllConfig(op).config.IsDegenerate(replica_count,
+                                                             partition_count);
+}
+
+/*static*/ CollectiveOpGroupMode NcclAllToAllStartThunk::GetGroupMode(
+    mlir::lmhlo_gpu::AllToAllStartOp op) {
+  return impl::GetNcclAllToAllConfig(op).config.group_mode;
+}
+
+Status NcclAllToAllStartThunk::RunNcclCollective(const ExecuteParams& params,
+                                                 ncclComm_t comm) {
+  return async_.Execute(
+      [this](const ExecuteParams& params, se::Stream& stream, ncclComm_t comm) {
+        return RunAllToAll(params, stream, comm);
+      },
+      params, comm);
+}
+
+NcclAllToAllDoneThunk::NcclAllToAllDoneThunk(
+    ThunkInfo thunk_info, NcclCollectiveThunk::AsyncExecutor& async)
+    : NcclCollectiveDoneThunk(Thunk::kNcclAllToAllDone, thunk_info, async) {}
+
+Status RunAllToAll(bool has_split_dimension,
+                   std::vector<DeviceBufferPair>& buffers, se::Stream& stream,
+                   ncclComm_t comm) {
 #if XLA_ENABLE_XCCL
-  int device_ordinal = params.stream->parent()->device_ordinal();
+  int device_ordinal = stream.parent()->device_ordinal();
   VLOG(3) << "Performing all-to-all from device ordinal: " << device_ordinal;
 
-  cudaStream_t* cu_stream = reinterpret_cast<cudaStream_t*>(
-      params.stream->implementation()->GpuStreamMemberHack());
+  se::gpu::GpuStreamHandle gpu_stream = se::gpu::AsGpuStreamValue(&stream);
 
   int num_participants;
   XLA_CUDA_RETURN_IF_ERROR(ncclCommCount(comm, &num_participants));
@@ -80,66 +135,64 @@ Status NcclAllToAllThunk::RunNcclCollective(const ExecuteParams& params,
   // in which case inputs are split and outputs concatenated in that dimension
   // (here, we only support dimension 0), or it takes a list of inputs
   // and produces a tuple of outputs.
-  if (config_.has_split_dimension) {
-    for (size_t i = 0; i < buffers_.size(); ++i) {
-      const Buffer& buffer = buffers_[i];
-      const uint8* send_buffer = static_cast<uint8*>(
-          params.buffer_allocations->GetDeviceAddress(buffer.source_buffer)
-              .opaque());
-      uint8* recv_buffer = static_cast<uint8*>(
-          params.buffer_allocations->GetDeviceAddress(buffer.destination_buffer)
-              .opaque());
+  if (has_split_dimension) {
+    for (size_t i = 0; i < buffers.size(); ++i) {
+      DeviceBufferPair& buffer = buffers[i];
+      const uint8_t* send_buffer =
+          static_cast<uint8_t*>(buffer.source_buffer.opaque());
+      uint8_t* recv_buffer =
+          static_cast<uint8_t*>(buffer.destination_buffer.opaque());
 
-      PrimitiveType element_type = config_.config.operand_element_type[i];
       TF_ASSIGN_OR_RETURN(auto dtype_and_multiplier,
-                          ToNcclDataTypeAndCountMultiplier(element_type));
+                          ToNcclDataTypeAndCountMultiplier(
+                              buffer.element_type, Thunk::kNcclAllToAll));
       ncclDataType_t dtype = dtype_and_multiplier.first;
-      int element_count = buffer.element_count * dtype_and_multiplier.second;
+      int64_t element_count =
+          buffer.element_count * dtype_and_multiplier.second;
 
       TF_RET_CHECK(element_count % num_participants == 0)
           << "Buffer was not an exact multiple of the number of participants.";
       size_t chunk_elements = element_count / num_participants;
-      size_t chunk_bytes =
-          chunk_elements * ShapeUtil::ByteSizeOfPrimitiveType(element_type);
+      size_t chunk_bytes = chunk_elements * ShapeUtil::ByteSizeOfPrimitiveType(
+                                                buffer.element_type);
 
       for (int rank = 0; rank < num_participants; ++rank) {
         XLA_CUDA_RETURN_IF_ERROR(ncclSend(send_buffer + rank * chunk_bytes,
                                           chunk_elements, dtype, rank, comm,
-                                          *cu_stream));
+                                          gpu_stream));
         XLA_CUDA_RETURN_IF_ERROR(ncclRecv(recv_buffer + rank * chunk_bytes,
                                           chunk_elements, dtype, rank, comm,
-                                          *cu_stream));
+                                          gpu_stream));
       }
     }
   } else {
-    TF_RET_CHECK(buffers_.size() == num_participants)
+    TF_RET_CHECK(buffers.size() == num_participants)
         << "Number of inputs didn't match the number of participants.";
 
-    for (size_t i = 0; i < buffers_.size(); ++i) {
-      const Buffer& buffer = buffers_[i];
-      const uint8* send_buffer = static_cast<uint8*>(
-          params.buffer_allocations->GetDeviceAddress(buffer.source_buffer)
-              .opaque());
-      uint8* recv_buffer = static_cast<uint8*>(
-          params.buffer_allocations->GetDeviceAddress(buffer.destination_buffer)
-              .opaque());
+    for (size_t i = 0; i < buffers.size(); ++i) {
+      DeviceBufferPair& buffer = buffers[i];
+      const uint8_t* send_buffer =
+          static_cast<uint8_t*>(buffer.source_buffer.opaque());
+      uint8_t* recv_buffer =
+          static_cast<uint8_t*>(buffer.destination_buffer.opaque());
 
-      PrimitiveType element_type = config_.config.operand_element_type[i];
       TF_ASSIGN_OR_RETURN(auto dtype_and_multiplier,
-                          ToNcclDataTypeAndCountMultiplier(element_type));
+                          ToNcclDataTypeAndCountMultiplier(
+                              buffer.element_type, Thunk::kNcclAllToAll));
       ncclDataType_t dtype = dtype_and_multiplier.first;
-      int element_count = buffer.element_count * dtype_and_multiplier.second;
+      int64_t element_count =
+          buffer.element_count * dtype_and_multiplier.second;
 
       XLA_CUDA_RETURN_IF_ERROR(ncclSend(send_buffer, element_count, dtype,
-                                        /*rank=*/i, comm, *cu_stream));
+                                        /*rank=*/i, comm, gpu_stream));
       XLA_CUDA_RETURN_IF_ERROR(ncclRecv(recv_buffer, element_count, dtype,
-                                        /*rank=*/i, comm, *cu_stream));
+                                        /*rank=*/i, comm, gpu_stream));
     }
   }
   XLA_CUDA_RETURN_IF_ERROR(ncclGroupEnd());
 
   VLOG(3) << "Done performing all-to-all for ordinal: " << device_ordinal;
-  return Status::OK();
+  return OkStatus();
 #else   // XLA_ENABLE_XCCL
   return Unimplemented(
       "NCCL support is not available: this binary was not built with a CUDA "

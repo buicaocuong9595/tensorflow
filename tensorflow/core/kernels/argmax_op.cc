@@ -25,6 +25,7 @@ limitations under the License.
 #include "tensorflow/core/kernels/argmax_op.h"
 
 #include <memory>
+
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
 #include "tensorflow/core/framework/bounds_check.h"
 #include "tensorflow/core/framework/op_kernel.h"
@@ -72,7 +73,9 @@ class ArgOp : public OpKernel {
     TensorShape output_shape;
     const TensorShape& input_shape = input.shape();
     for (int d = 0; d < input_dims - 1; ++d) {
-      output_shape.AddDim(input_shape.dim_size((d < axis) ? d : d + 1));
+      OP_REQUIRES_OK(context,
+                     output_shape.AddDimWithStatus(
+                         input_shape.dim_size((d < axis) ? d : d + 1)));
     }
     Tensor* output = nullptr;
     OP_REQUIRES_OK(context, context->allocate_output(0, output_shape, &output));
@@ -151,7 +154,19 @@ class ArgMinOp
                               .TypeConstraint<type>("T")              \
                               .TypeConstraint<int32>("output_type")   \
                               .HostMemory("dimension"),               \
-                          ArgMinOp<CPUDevice, type, int32>);
+                          ArgMinOp<CPUDevice, type, int32>);          \
+  REGISTER_KERNEL_BUILDER(Name("ArgMax")                              \
+                              .Device(DEVICE_CPU)                     \
+                              .TypeConstraint<type>("T")              \
+                              .TypeConstraint<int16>("output_type")   \
+                              .HostMemory("dimension"),               \
+                          ArgMaxOp<CPUDevice, type, int16>);          \
+  REGISTER_KERNEL_BUILDER(Name("ArgMax")                              \
+                              .Device(DEVICE_CPU)                     \
+                              .TypeConstraint<type>("T")              \
+                              .TypeConstraint<uint16>("output_type")  \
+                              .HostMemory("dimension"),               \
+                          ArgMaxOp<CPUDevice, type, uint16>);
 
 TF_CALL_REAL_NUMBER_TYPES(REGISTER_ARGMAX);
 TF_CALL_bool(REGISTER_ARGMAX);

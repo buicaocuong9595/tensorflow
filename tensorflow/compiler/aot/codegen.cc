@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "tensorflow/compiler/aot/codegen.h"
 
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -88,7 +89,7 @@ Status XLATypeToCpp(xla::PrimitiveType type, string* str) {
       return errors::Unimplemented("XLA type ", xla::PrimitiveType_Name(type),
                                    " has no equivalent in C++");
   }
-  return Status::OK();
+  return OkStatus();
 }
 
 // Returns the sum of the size of each buffer in `buffer_infos`.
@@ -150,7 +151,7 @@ Status AddRewritesForShape(int i, const xla::Shape& shape,
   rewrites->push_back({"{{DIM_SIZES}}", dim_sizes});
   rewrites->push_back({"{{INDICES}}", indices});
   rewrites->push_back({"{{COUNT}}", absl::StrCat(count)});
-  return Status::OK();
+  return OkStatus();
 }
 
 // Returns code rewritten by replacing all rewrite pairs, with an extra rewrite
@@ -214,7 +215,7 @@ Status GenArgMethods(const tf2xla::Config& config,
       *methods += RewriteWithName("_" + config.feed(i).name(), code, rewrites);
     }
   }
-  return Status::OK();
+  return OkStatus();
 }
 
 // Generate methods for results (outputs).
@@ -268,7 +269,7 @@ Status GenResultMethods(const tf2xla::Config& config,
       *methods += RewriteWithName("_" + config.fetch(i).name(), code, rewrites);
     }
   }
-  return Status::OK();
+  return OkStatus();
 }
 
 // Generate methods for variables.
@@ -309,7 +310,7 @@ Status GenVariableMethods(const tf2xla::Config& config,
     *methods += RewriteWithName(
         var.name().empty() ? var.node_name() : var.name(), code, rewrites);
   }
-  return Status::OK();
+  return OkStatus();
 }
 
 // Generates code implementing {Arg,Result}Names(), where T is one of
@@ -366,7 +367,7 @@ Status ValidateFeedFetchCppNames(const tf2xla::Config& config) {
           ValidateCppIdent(variable.node_name(), "variable name"));
     }
   }
-  return Status::OK();
+  return OkStatus();
 }
 
 // Returns a list of C++ expressions that, when executed, will construct the
@@ -377,14 +378,16 @@ std::vector<string> BufferInfosToCppExpression(
   std::transform(buffer_infos.begin(), buffer_infos.end(),
                  std::back_inserter(buffer_infos_as_strings),
                  [](const BufferInfo& buffer_info) {
-                   std::pair<uint64, uint64> encoded = buffer_info.Encode();
-                   string encoded_second_as_str =
-                       encoded.second == ~0ULL
-                           ? "~0ULL"
-                           : absl::StrCat(encoded.second, "ULL");
+                   xla::cpu_function_runtime::EncodedBufferInfo encoded =
+                       buffer_info.Encode();
+                   auto param_to_str = [](uint32_t param) -> std::string {
+                     return param == ~0U ? "~0U" : absl::StrCat(param, "U");
+                   };
                    return absl::StrCat(
-                       "::xla::cpu_function_runtime::BufferInfo({",
-                       encoded.first, "ULL, ", encoded_second_as_str, "})");
+                       "::xla::cpu_function_runtime::BufferInfo(",
+                       encoded.packed_kind_and_size, "ULL, ",
+                       param_to_str(encoded.entry_param_number), ", ",
+                       param_to_str(encoded.result_param_number), ")");
                  });
   return buffer_infos_as_strings;
 }
@@ -502,7 +505,8 @@ namespace xla { class ExecutableRunOptions; }
 // (Implementation detail) Entry point to the function in the object file.
 extern "C" void {{ENTRY}}(
     void* result, const ::xla::ExecutableRunOptions* run_options,
-    const void** args, void** temps, int64_t* profile_counters);
+    const void** args, void** temps, XlaCustomCallStatus* status,
+    int64_t* profile_counters);
 
 {{DECLS_FROM_OBJ_FILE}}
 
@@ -727,7 +731,7 @@ class {{CLASS}} final : public tensorflow::XlaCompiledCpuFunction {
       {"{{BUFFER_INFOS_AS_STRING}}",
        absl::StrJoin(buffer_infos_as_strings, ",\n")}};
   absl::StrReplaceAll(rewrites, header);
-  return Status::OK();
+  return OkStatus();
 }
 
 static string CreateUniqueIdentifier(const CodegenOpts& opts,
@@ -748,7 +752,7 @@ Status GenerateMetadata(const CodegenOpts& opts,
 
   if (opts.gen_program_shape) {
     program_shape =
-        absl::make_unique<xla::ProgramShapeProto>(compile_result.program_shape);
+        std::make_unique<xla::ProgramShapeProto>(compile_result.program_shape);
 
     // The parameter names are currently meaningless, and redundant with the
     // rest of our metadata, so clear them out to avoid confusion and save
@@ -784,7 +788,7 @@ Status GenerateMetadata(const CodegenOpts& opts,
       std::move(embedded_protobufs.cpp_shims[1].variable_decl));
   metadata_result->object_file_data =
       std::move(embedded_protobufs.object_file_data);
-  return Status::OK();
+  return OkStatus();
 }
 
 Status ParseCppClass(const string& cpp_class, string* class_name,
@@ -810,7 +814,7 @@ Status ParseCppClass(const string& cpp_class, string* class_name,
       *class_name = parts[i];
     }
   }
-  return Status::OK();
+  return OkStatus();
 }
 
 Status ValidateCppIdent(absl::string_view ident, absl::string_view msg) {
@@ -834,7 +838,7 @@ Status ValidateCppIdent(absl::string_view ident, absl::string_view msg) {
       return errors::InvalidArgument("illegal char: ", msg);
     }
   }
-  return Status::OK();
+  return OkStatus();
 }
 
 }  // namespace tfcompile

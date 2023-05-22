@@ -13,24 +13,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include "tensorflow/compiler/mlir/tensorflow/transforms/tf_saved_model_freeze_variables.h"
+
+#include <iterator>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Casting.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"  // from @llvm-project
+#include "mlir/Dialect/Func/IR/FuncOps.h"  // from @llvm-project
 #include "mlir/IR/Builders.h"  // from @llvm-project
 #include "mlir/IR/BuiltinAttributes.h"  // from @llvm-project
 #include "mlir/IR/Location.h"  // from @llvm-project
 #include "mlir/IR/Value.h"  // from @llvm-project
 #include "mlir/Interfaces/CallInterfaces.h"  // from @llvm-project
-#include "mlir/Pass/Pass.h"  // from @llvm-project
 #include "tensorflow/compiler/mlir/tensorflow/analysis/resource_value_typed_analyzer.h"
 #include "tensorflow/compiler/mlir/tensorflow/ir/tf_ops.h"
 #include "tensorflow/compiler/mlir/tensorflow/ir/tf_saved_model.h"
@@ -44,20 +48,22 @@ namespace mlir {
 namespace tf_saved_model {
 namespace {
 
+// Attribute name that specifies the input shapes of a function.
+constexpr StringRef kTfInputShapesAttr = "tf._input_shapes";
+
 // Build and returns ElementsAttr which holds the data in 'tensor'.
 ElementsAttr GetTensorValueAsElementsAttr(const tensorflow::Tensor& tensor,
                                           OpBuilder builder) {
   tensorflow::StatusOr<ElementsAttr> tensor_attr_or =
       tensorflow::ConvertTensor(tensor, &builder);
   if (!tensor_attr_or.ok()) return nullptr;
-  return tensor_attr_or.ValueOrDie();
+  return tensor_attr_or.value();
 }
 
-// Creates ConstantOp which holds 'tensor_elements'.
-mlir::ConstantOp GetConstOpFromElementsAttr(ElementsAttr tensor_elements,
-                                            OpBuilder builder, Location loc) {
-  return builder.create<mlir::ConstantOp>(loc, tensor_elements.getType(),
-                                          tensor_elements);
+// Creates a constant op that holds 'tensor_elements'.
+TF::ConstOp GetConstOpFromElementsAttr(ElementsAttr tensor_elements,
+                                       OpBuilder builder, Location loc) {
+  return builder.create<TF::ConstOp>(loc, tensor_elements);
 }
 
 // Returns ElementsAttr which has the value held by 'resource_tensor'.
@@ -98,39 +104,46 @@ void PropagateUsage(TF::ReadVariableOp read_variable_op, ElementsAttr value) {
 void PropagateUsage(
     Operation* user_op, int argument_index, ElementsAttr value,
     llvm::SmallVector<std::pair<Region*, int>, 4>* work_list,
-    llvm::DenseMap<Operation*, llvm::SmallVector<unsigned int, 4>>*
+    llvm::MapVector<Operation*, llvm::SmallVector<unsigned int, 4>>*
         arguments_to_erase) {
   if (auto read_variable_op = dyn_cast<TF::ReadVariableOp>(user_op)) {
-    PropagateUsage(read_variable_op, value);
     (*arguments_to_erase)[read_variable_op];
+    PropagateUsage(read_variable_op, value);
   } else if (auto call = dyn_cast<CallOpInterface>(user_op)) {
-    if (auto func = dyn_cast<FuncOp>(call.resolveCallable())) {
+    (*arguments_to_erase)[call].push_back(argument_index);
+    if (auto func = dyn_cast<func::FuncOp>(call.resolveCallable())) {
       (*arguments_to_erase)[func].push_back(argument_index);
       work_list->push_back(std::make_pair(&func.getRegion(), argument_index));
     }
-    (*arguments_to_erase)[call].push_back(argument_index);
   } else if (auto if_op = dyn_cast<TF::IfOp>(user_op)) {
+    (*arguments_to_erase)[if_op].push_back(argument_index);
     for (auto callee : {if_op.then_function(), if_op.else_function()}) {
       (*arguments_to_erase)[callee].push_back(argument_index - 1);
-      work_list->push_back(std::make_pair(&callee.body(), argument_index - 1));
+      work_list->push_back(
+          std::make_pair(&callee.getBody(), argument_index - 1));
     }
-    (*arguments_to_erase)[if_op].push_back(argument_index);
   } else if (auto if_op = dyn_cast<TF::IfRegionOp>(user_op)) {
-    for (auto callee : {&if_op.then_branch(), &if_op.else_branch()}) {
+    (*arguments_to_erase)[if_op].push_back(argument_index);
+    for (auto callee : {&if_op.getThenBranch(), &if_op.getElseBranch()}) {
       work_list->push_back(std::make_pair(callee, argument_index));
     }
-    (*arguments_to_erase)[if_op].push_back(argument_index);
   } else if (auto while_op = dyn_cast<TF::WhileOp>(user_op)) {
+    (*arguments_to_erase)[while_op].push_back(argument_index);
     for (auto callee : {while_op.cond_function(), while_op.body_function()}) {
       (*arguments_to_erase)[callee].push_back(argument_index);
-      work_list->push_back(std::make_pair(&callee.body(), argument_index));
+      work_list->push_back(std::make_pair(&callee.getBody(), argument_index));
     }
-    (*arguments_to_erase)[while_op].push_back(argument_index);
   } else if (auto while_op = dyn_cast<TF::WhileRegionOp>(user_op)) {
-    for (auto callee : {&while_op.cond(), &while_op.body()}) {
+    (*arguments_to_erase)[while_op].push_back(argument_index);
+    for (auto callee : {&while_op.getCond(), &while_op.getBody()}) {
       work_list->push_back(std::make_pair(callee, argument_index));
     }
-    (*arguments_to_erase)[while_op].push_back(argument_index);
+  } else if (auto batch_func_op = dyn_cast<TF::BatchFunctionOp>(user_op)) {
+    (*arguments_to_erase)[batch_func_op].push_back(argument_index);
+    // Add the called function to the work list.
+    func::FuncOp func_op = batch_func_op.func();
+    (*arguments_to_erase)[func_op].push_back(argument_index);
+    work_list->push_back({&func_op.getRegion(), argument_index});
   }
 }
 
@@ -138,7 +151,7 @@ void PropagateUsage(
 void PropagateUsage(
     Region* region, ElementsAttr value, int argument_index,
     llvm::SmallVector<std::pair<Region*, int>, 4>* work_list,
-    llvm::DenseMap<Operation*, llvm::SmallVector<unsigned int, 4>>*
+    llvm::MapVector<Operation*, llvm::SmallVector<unsigned int, 4>>*
         arguments_to_erase) {
   auto arg = region->getArgument(argument_index);
   for (auto& usage : arg.getUses()) {
@@ -154,7 +167,7 @@ void PropagateUsage(
 // All op operands updates are captured in 'arguments_to_erase'.
 void ReplaceVarWithConstant(
     TF::VarHandleOp var_handle_op, ElementsAttr value,
-    llvm::DenseMap<Operation*, llvm::SmallVector<unsigned int, 4>>*
+    llvm::MapVector<Operation*, llvm::SmallVector<unsigned int, 4>>*
         arguments_to_erase) {
   llvm::SmallVector<std::pair<Region*, int>, 4> work_list;
   for (auto& usage : var_handle_op->getUses()) {
@@ -172,38 +185,6 @@ void ReplaceVarWithConstant(
                    arguments_to_erase);
     visited.insert(work_item);
   }
-}
-
-// A pass that tries to freeze / constant fold read only variables in the graph.
-// The pass will analyze the variable usage and if the variable is immutable
-// it will replace it with constant tensor which has its value.
-// Note: This pass currently only works with variables that are initialized
-// during Session init function only. Expanding to other uses is a todo.
-class FreezeVariablesPass
-    : public PassWrapper<FreezeVariablesPass, OperationPass<ModuleOp>> {
- public:
-  // If no session is provided or null the pass is no-op.
-  explicit FreezeVariablesPass(tensorflow::Session* session = nullptr)
-      : session_(session) {}
-
-  void runOnOperation() override;
-
- private:
-  tensorflow::Session* session_;
-};
-
-// Helper that returns the FuncOp that is the SessionInit function which
-// will be called to initialize all resources.
-// Returns nullptr if no function is found.
-FuncOp GetSessionInitializerFunc(ModuleOp module) {
-  auto session_init_op = tf_saved_model::GetSessionInitializerOp(module);
-  SymbolTable symbol_table(module);
-  if (session_init_op && !session_init_op.initializers().empty()) {
-    FuncOp init_func_op = symbol_table.lookup<mlir::FuncOp>(
-        session_init_op.initializers()[0].cast<FlatSymbolRefAttr>().getValue());
-    return init_func_op;
-  }
-  return nullptr;
 }
 
 // Returns ID for identifying a resource.
@@ -229,10 +210,10 @@ std::tuple<llvm::StringRef, llvm::StringRef, llvm::StringRef> GetResourceKey(
 }
 
 // Remove the initialization of the variables in 'var_handle_ops' from
-// the session init function 'sesion_init_func'
+// the session init function 'session_init_func'
 void RemoveVariablesInitializations(
     const llvm::SmallVector<TF::VarHandleOp, 4>& var_handle_ops,
-    FuncOp sesion_init_func) {
+    func::FuncOp session_init_func) {
   // We identify the variables using (device, container, shared_name) of the
   // resource. Capture them here and use them to identify the useless
   // initializations.
@@ -242,7 +223,7 @@ void RemoveVariablesInitializations(
     variables.insert(GetResourceKey(var_handle_op));
 
   llvm::SmallVector<Operation*, 4> work_list;
-  for (auto var_handle_op : sesion_init_func.getOps<TF::VarHandleOp>()) {
+  for (auto var_handle_op : session_init_func.getOps<TF::VarHandleOp>()) {
     if (variables.count(GetResourceKey(var_handle_op)))
       work_list.push_back(var_handle_op);
   }
@@ -268,28 +249,30 @@ void RemoveVariablesInitializations(
 // Updates terminator op arguments of 'func' after removing arguments
 // specified in 'arguments_to_erase'.
 template <typename T>
-void UpdateTerminatorArguments(
-    T& func, const llvm::SmallVector<unsigned, 4>& arguments_to_erase) {
-  llvm::BitVector erase_indices(func.front().getTerminator()->getNumOperands());
+void UpdateTerminatorArguments(T& func,
+                               const ArrayRef<unsigned> arguments_to_erase,
+                               llvm::BitVector& erase_indices) {
+  auto terminator = func.front().getTerminator();
+  int num_operands = terminator->getNumOperands();
+  erase_indices.resize(num_operands);
   for (auto arg_index : arguments_to_erase) {
     auto argument = func.getArgument(arg_index);
     for (auto& use : argument.getUses()) {
-      if (llvm::isa<ReturnOp, TF::YieldOp>(use.getOwner())) {
-        int operand_index = argument.getUses().begin()->getOperandNumber();
-        erase_indices.set(operand_index);
+      if (llvm::isa<func::ReturnOp, TF::YieldOp>(use.getOwner())) {
+        erase_indices.set(use.getOperandNumber());
       }
     }
     func.getArgument(arg_index).dropAllUses();
   }
-  if (llvm::isa<ReturnOp, TF::YieldOp>(func.front().getTerminator())) {
-    func.front().getTerminator()->eraseOperands(erase_indices);
+  if (llvm::isa<func::ReturnOp, TF::YieldOp>(func.front().getTerminator())) {
+    terminator->eraseOperands(erase_indices);
   }
 }
 
 // Updates 'while_op' signatures based on which arguments should be removed
 // in 'arguments_to_erase'.
-template <typename T>
-T GetUpdatedWhileOp(T while_op,
+template <typename T, typename U>
+T GetUpdatedWhileOp(T while_op, const U& argument_types,
                     const llvm::SmallVector<unsigned, 4>& arguments_to_erase) {
   OpBuilder builder(while_op);
   llvm::SmallVector<Type, 4> new_operand_types;
@@ -300,40 +283,103 @@ T GetUpdatedWhileOp(T while_op,
   for (int i : arguments_to_erase) skip_indices.set(i);
   for (int i = 0; i < num_operands; ++i) {
     if (!skip_indices.test(i)) {
-      new_operand_types.emplace_back(operands[i].getType());
+      new_operand_types.emplace_back(argument_types[i]);
       new_operands.emplace_back(operands[i]);
     }
   }
   auto new_while_op = builder.create<T>(while_op->getLoc(), new_operand_types,
                                         new_operands, while_op->getAttrs());
+  int new_index = 0;
   for (int i = 0; i < num_operands; ++i) {
     if (!skip_indices.test(i)) {
-      while_op->getResult(i).replaceAllUsesWith(new_while_op->getResult(i));
+      while_op->getResult(i).replaceAllUsesWith(
+          new_while_op->getResult(new_index++));
     }
   }
   return new_while_op;
 }
 
-void FreezeVariablesPass::runOnOperation() {
-  if (!session_) return;
-  ModuleOp module = getOperation();
-  const tensorflow::DeviceMgr* mgr = nullptr;
-  auto status = session_->LocalDeviceManager(&mgr);
-  if (!status.ok()) {
-    module->emitError("failed to fetch device manager: " +
-                      status.error_message());
-    return signalPassFailure();
+// Erases function arguments indexed at `args_to_erase`. Also applies the
+// changes to any relevant function attributes accordingly.
+void EraseFuncOpArguments(func::FuncOp func_op,
+                          const ArrayRef<unsigned> args_to_erase) {
+  BitVector args_to_erase_bit_vector(func_op.getNumArguments());
+  for (const unsigned i : args_to_erase) args_to_erase_bit_vector.set(i);
+
+  func_op.eraseArguments(args_to_erase_bit_vector);
+
+  // Erases entries in "tf._input_shapes" attribute of `func_op` that correspond
+  // to the erased arguments.
+  if (auto input_shapes_attr =
+          func_op->getAttrOfType<ArrayAttr>(kTfInputShapesAttr);
+      input_shapes_attr) {
+    // Construct a new array of input shapes excluding the input shapes of the
+    // erased arguments.
+    SmallVector<Attribute> updated_input_shapes_attr;
+    for (const unsigned i : args_to_erase_bit_vector.flip().set_bits()) {
+      updated_input_shapes_attr.emplace_back(input_shapes_attr[i]);
+    }
+
+    // Replaces the attribute with the updated "#tf_type.shape" array.
+    // Builder builder(func_op.getContext());
+    func_op->setAttr(
+        kTfInputShapesAttr,
+        ArrayAttr::get(func_op.getContext(), updated_input_shapes_attr));
+  }
+}
+
+// Validates func ops. Returns `failure` if the function is invalid.
+LogicalResult ValidateFuncOp(func::FuncOp func_op) {
+  auto input_shapes_attr =
+      func_op->getAttrOfType<ArrayAttr>(kTfInputShapesAttr);
+  if (!input_shapes_attr) return success();
+
+  if (input_shapes_attr.size() != func_op.getNumArguments()) {
+    return func_op->emitError(
+               "Number of arguments and 'tf._input_shapes' "
+               "attribute size do not match. ")
+           << "Num args: " << func_op.getNumArguments()
+           << ", tf._input_shapes size: " << input_shapes_attr.size();
   }
 
-  FuncOp session_init_func = GetSessionInitializerFunc(module);
+  return success();
+}
+
+// Validates ModuleOp. Returns `failure` if the module op is invalid.
+LogicalResult ValidateModule(ModuleOp module_op) {
+  for (auto func_op : module_op.getOps<func::FuncOp>()) {
+    if (failed(ValidateFuncOp(func_op))) {
+      return failure();
+    }
+  }
+  return success();
+}
+
+}  // namespace
+
+LogicalResult FreezeVariables(ModuleOp module, tensorflow::Session* session) {
+  if (failed(ValidateModule(module))) return failure();
+
+  const tensorflow::DeviceMgr* mgr = nullptr;
+  auto status = session->LocalDeviceManager(&mgr);
+  if (!status.ok()) {
+    module->emitError(
+        absl::StrCat("failed to fetch device manager: ", status.message()));
+    return failure();
+  }
+
+  SmallVector<func::FuncOp, 2> session_init_funcs =
+      tf_saved_model::GetInitializerFunctions(module);
+  func::FuncOp session_init_func =
+      session_init_funcs.empty() ? nullptr : session_init_funcs[0];
 
   TF::ResourceAnalyzer analyzer(module, /*skip_session_init=*/true);
   llvm::SmallVector<TF::VarHandleOp, 4> variables;
   // Capture list of all read only variables.
-  for (auto func : module.getOps<FuncOp>()) {
+  for (auto func : module.getOps<func::FuncOp>()) {
     if (func == session_init_func) continue;
     for (auto var_handle_op : func.getOps<TF::VarHandleOp>()) {
-      if (!analyzer.IsPotentiallyWritten(var_handle_op.resource())) {
+      if (!analyzer.IsPotentiallyWritten(var_handle_op.getResource())) {
         variables.push_back(var_handle_op);
       }
     }
@@ -341,10 +387,10 @@ void FreezeVariablesPass::runOnOperation() {
 
   // Fetch the values to replace the VarHandleOps with.
   auto resource_tensors_or =
-      tf_saved_model::GetResourcesFromSession(variables, session_);
+      tf_saved_model::GetResourcesFromSession(variables, session);
   if (!resource_tensors_or.ok()) {
     module->emitError(resource_tensors_or.status().message().data());
-    signalPassFailure();
+    return failure();
   }
 
   auto* context = module.getContext();
@@ -356,46 +402,70 @@ void FreezeVariablesPass::runOnOperation() {
 
   // Container to hold all update actions on ops.
   // Key: Operation to update.
-  // Value: optional list of arguments to delete from this op.
-  llvm::DenseMap<Operation*, llvm::SmallVector<unsigned int, 4>>
+  // Value: optional list of argument indices to delete from this op.
+  // Note that we use MapVector because we want to iterate on the same order
+  // of insertion.
+  llvm::MapVector<Operation*, llvm::SmallVector<unsigned int, 4>>
       arguments_to_erase;
-  for (auto variable_value_pair :
+  for (auto [var_handle_op, resource_tensor] :
        llvm::zip(variables, resource_tensors_or.value())) {
-    auto var_handle_op = std::get<0>(variable_value_pair);
     builder.setInsertionPointAfterValue(var_handle_op);
     auto elements_attr = GetTensorValueAsElementsAttr(
-        var_handle_op, std::get<1>(variable_value_pair), mgr, builder);
+        var_handle_op, resource_tensor, mgr, builder);
     ReplaceVarWithConstant(var_handle_op, elements_attr, &arguments_to_erase);
   }
 
   // All updates to different ops are captured in 'arguments_to_erase'.
   // Now loop on them and based on each item type update accordingly.
-  for (auto& items : arguments_to_erase) {
-    if (auto func = dyn_cast<FuncOp>(items.getFirst())) {
-      UpdateTerminatorArguments(func, items.getSecond());
-      func.eraseArguments(items.getSecond());
-    } else if (auto read_var = dyn_cast<TF::ReadVariableOp>(items.getFirst())) {
+  for (auto& [user_op, args_to_erase] : arguments_to_erase) {
+    if (auto func = dyn_cast<func::FuncOp>(user_op)) {
+      // To update a function we will need to:
+      // 1) Remove the unused arguments from the function itself.
+      //    1-2) Remove func attributes corresponding to the removed arguments.
+      // 2) Remove any returns that are not needed from the function terminator
+      //    op in the function.
+      // 3) Update function result to match the terminator.
+      llvm::BitVector result_indices_to_erase;
+      UpdateTerminatorArguments(func, args_to_erase, result_indices_to_erase);
+      EraseFuncOpArguments(func, args_to_erase);
+
+      func.eraseResults(result_indices_to_erase);
+    } else if (auto read_var = dyn_cast<TF::ReadVariableOp>(user_op)) {
       // Read variables was already replaced by constant op. Just remove the op.
       read_var->erase();
-    } else if (auto while_op = dyn_cast<TF::WhileOp>(items.getFirst())) {
-      auto new_while_op =
-          GetUpdatedWhileOp<TF::WhileOp>(while_op, items.getSecond());
-      new_while_op.body_function().eraseResults(items.getSecond());
+    } else if (auto while_op = dyn_cast<TF::WhileOp>(user_op)) {
+      GetUpdatedWhileOp<TF::WhileOp>(
+          while_op, while_op.cond_function().getArgumentTypes(), args_to_erase);
       while_op->erase();
-    } else if (auto while_op = dyn_cast<TF::WhileRegionOp>(items.getFirst())) {
-      auto new_while_op = GetUpdatedWhileOp(while_op, items.getSecond());
-      new_while_op.cond().takeBody(while_op.cond());
-      new_while_op.body().takeBody(while_op.body());
-      UpdateTerminatorArguments(new_while_op.body(), items.getSecond());
-      new_while_op.body().front().eraseArguments(items.getSecond());
-      new_while_op.cond().front().eraseArguments(items.getSecond());
+    } else if (auto while_op = dyn_cast<TF::WhileRegionOp>(user_op)) {
+      auto new_while_op = GetUpdatedWhileOp(
+          while_op, while_op.getCond().getArgumentTypes(), args_to_erase);
+      new_while_op.getCond().takeBody(while_op.getCond());
+      new_while_op.getBody().takeBody(while_op.getBody());
+      llvm::BitVector erase_indices;
+      UpdateTerminatorArguments(new_while_op.getBody(), args_to_erase,
+                                erase_indices);
+      llvm::BitVector body_bit_vector(
+          new_while_op.getBody().front().getNumArguments());
+      for (auto i : args_to_erase) body_bit_vector.set(i);
+      new_while_op.getBody().front().eraseArguments(body_bit_vector);
+      llvm::BitVector cond_bit_vector(
+          new_while_op.getCond().front().getNumArguments());
+      for (auto i : args_to_erase) cond_bit_vector.set(i);
+      new_while_op.getCond().front().eraseArguments(cond_bit_vector);
       while_op->erase();
-    } else {
-      llvm::BitVector erase_indices(items.getFirst()->getNumOperands());
-      for (auto operand_index : items.getSecond()) {
+    } else if (auto batch_func_op = dyn_cast<TF::BatchFunctionOp>(user_op)) {
+      llvm::BitVector erase_indices(user_op->getNumOperands());
+      for (auto operand_index : args_to_erase) {
         erase_indices.set(operand_index);
       }
-      items.getFirst()->eraseOperands(erase_indices);
+      batch_func_op.eraseArguments(erase_indices);
+    } else {
+      llvm::BitVector erase_indices(user_op->getNumOperands());
+      for (auto operand_index : args_to_erase) {
+        erase_indices.set(operand_index);
+      }
+      user_op->eraseOperands(erase_indices);
     }
   }
 
@@ -407,12 +477,7 @@ void FreezeVariablesPass::runOnOperation() {
   for (auto var_handle_op : variables) {
     if (var_handle_op) var_handle_op->erase();
   }
-}
-}  // namespace
-
-std::unique_ptr<OperationPass<ModuleOp>> CreateFreezeVariablesPass(
-    tensorflow::Session* session) {
-  return std::make_unique<FreezeVariablesPass>(session);
+  return success();
 }
 
 }  // namespace tf_saved_model

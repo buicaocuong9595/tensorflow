@@ -20,14 +20,18 @@ limitations under the License.
 #include <string.h>
 
 #include <initializer_list>
+#include <memory>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/strings/match.h"
-#include "tensorflow/lite/c/builtin_op_data.h"
+#include "tensorflow/lite/c/c_api_types.h"
 #include "tensorflow/lite/c/common.h"
-#include "tensorflow/lite/testing/util.h"
+#include "tensorflow/lite/core/c/builtin_op_data.h"
+#include "tensorflow/lite/core/c/common.h"
+#include "tensorflow/lite/core/interpreter.h"
+#include "tensorflow/lite/util.h"
 
 namespace tflite {
 namespace {
@@ -126,7 +130,7 @@ TEST_F(KernelUtilTest, BroadcastShapeIncompatibleDim) {
                                                   &tensor2_, &output));
   EXPECT_EQ(output, nullptr);
   EXPECT_EQ(context_.error,
-            "Given shapes, [1, 2] and [1, 3], are not broadcastable.");
+            "Given shapes, [1,2] and [1,3], are not broadcastable.");
 }
 
 TEST_F(KernelUtilTest, BroadcastShapeIncompatibleDimWithZero) {
@@ -137,7 +141,7 @@ TEST_F(KernelUtilTest, BroadcastShapeIncompatibleDimWithZero) {
                                                   &tensor2_, &output));
   EXPECT_EQ(output, nullptr);
   EXPECT_EQ(context_.error,
-            "Given shapes, [1, 0] and [1, 3], are not broadcastable.");
+            "Given shapes, [1,0] and [1,3], are not broadcastable.");
 }
 
 TEST_F(KernelUtilTest, BroadcastShapeOnes) {
@@ -216,7 +220,7 @@ TEST_F(KernelUtilTest, BroadcastShapeIncompatibleDimOnThreeTensors) {
                                        &tensor3_, &output));
   EXPECT_EQ(output, nullptr);
   EXPECT_EQ(context_.error,
-            "Given shapes, [1, 2], [1, 3] and [1, 4], are not broadcastable.");
+            "Given shapes, [1,2], [1,3] and [1,4], are not broadcastable.");
 }
 
 TEST_F(KernelUtilTest, BroadcastShapeIncompatibleDimWithZeroOnThreeTensors) {
@@ -229,7 +233,7 @@ TEST_F(KernelUtilTest, BroadcastShapeIncompatibleDimWithZeroOnThreeTensors) {
                                        &tensor3_, &output));
   EXPECT_EQ(output, nullptr);
   EXPECT_EQ(context_.error,
-            "Given shapes, [1, 1], [1, 3] and [1, 0], are not broadcastable.");
+            "Given shapes, [1,1], [1,3] and [1,0], are not broadcastable.");
 }
 
 TEST_F(KernelUtilTest, BroadcastShapeOnesOnThreeTensors) {
@@ -329,6 +333,30 @@ TEST_F(KernelUtilTest, BroadcastShapeWithZeroOnThreeTensors) {
                                        &tensor3_, &output));
   EXPECT_THAT(GetShape(output), ElementsAre(1, 2, 0, 4));
   TfLiteIntArrayFree(output);
+}
+
+TEST_F(KernelUtilTest, GetShapeDebugString) {
+  TfLiteIntArray* dims0 = TfLiteIntArrayCreate(0);
+  EXPECT_EQ("[]", GetShapeDebugString(dims0));
+  TfLiteIntArrayFree(dims0);
+
+  TfLiteIntArray* dims1 = TfLiteIntArrayCreate(1);
+  dims1->data[0] = 1;
+  EXPECT_EQ("[1]", GetShapeDebugString(dims1));
+  TfLiteIntArrayFree(dims1);
+
+  TfLiteIntArray* dims2 = TfLiteIntArrayCreate(2);
+  dims2->data[0] = 2;
+  dims2->data[1] = 3;
+  EXPECT_EQ("[2,3]", GetShapeDebugString(dims2));
+  TfLiteIntArrayFree(dims2);
+
+  TfLiteIntArray* dims3 = TfLiteIntArrayCreate(3);
+  dims3->data[0] = 4;
+  dims3->data[1] = 5;
+  dims3->data[2] = 6;
+  EXPECT_EQ("[4,5,6]", GetShapeDebugString(dims3));
+  TfLiteIntArrayFree(dims3);
 }
 
 TEST_F(KernelUtilTest, CheckAndPopulate) {
@@ -875,6 +903,98 @@ TEST_F(KernelUtilTest, IsMobilePlatform) {
 #elif defined(_WIN32)
   EXPECT_FALSE(IsMobilePlatform());
 #endif
+}
+
+TEST_F(KernelUtilTest, HasUnspecifiedDimension) {
+  TfLiteTensor tensor;
+  TfLiteIntArray* shape_sig = TfLiteIntArrayCreate(3);
+  shape_sig->data[0] = 1;
+  shape_sig->data[1] = -1;
+  shape_sig->data[2] = 3;
+  tensor.dims_signature = shape_sig;
+
+  EXPECT_TRUE(HasUnspecifiedDimension(&tensor));
+
+  shape_sig->data[1] = 2;
+  EXPECT_FALSE(HasUnspecifiedDimension(&tensor));
+
+  TfLiteIntArrayFree(shape_sig);
+}
+
+// Sets up a TFLite context and default values to initialize/resize test
+// tensors.
+class SetTensorAllocationTypeTest : public testing::Test {
+ public:
+  SetTensorAllocationTypeTest() { tensor_.type = kTfLiteInt32; }
+  ~SetTensorAllocationTypeTest() override { TfLiteTensorFree(&tensor_); }
+
+ protected:
+  Interpreter interpreter_;
+  TfLiteContext& context_ = *interpreter_.primary_subgraph().context();
+  std::unique_ptr<TfLiteIntArray, TfLiteIntArrayDeleter> dims_ =
+      BuildTfLiteIntArray({2, 3, 4});
+  TfLiteTensor tensor_{};
+};
+
+TEST_F(SetTensorAllocationTypeTest,
+       SetUnallocatedDynamicTensorToDynamicIsANoop) {
+  tensor_.allocation_type = kTfLiteDynamic;
+  SetTensorToDynamic(&tensor_);
+  EXPECT_EQ(tensor_.data.data, nullptr);
+  EXPECT_EQ(tensor_.allocation_type, kTfLiteDynamic);
+}
+
+TEST_F(SetTensorAllocationTypeTest, SetAllocatedDynamicTensorToDynamicIsANoop) {
+  tensor_.allocation_type = kTfLiteDynamic;
+  ASSERT_EQ(context_.ResizeTensor(&context_, &tensor_, dims_.release()),
+            kTfLiteOk);
+  const void* const original_data = tensor_.data.data;
+  SetTensorToDynamic(&tensor_);
+  EXPECT_EQ(tensor_.data.data, original_data);
+  EXPECT_EQ(tensor_.allocation_type, kTfLiteDynamic);
+}
+
+TEST_F(SetTensorAllocationTypeTest,
+       SetAllocatedPersistentRoTensorToDynamicFreesExistingTensorData) {
+  tensor_.allocation_type = kTfLitePersistentRo;
+  ASSERT_EQ(context_.ResizeTensor(&context_, &tensor_, dims_.release()),
+            kTfLiteOk);
+
+  // Leak checker will raise an error if data is not freed.
+  SetTensorToDynamic(&tensor_);
+  EXPECT_EQ(tensor_.data.data, nullptr);
+  EXPECT_EQ(tensor_.allocation_type, kTfLiteDynamic);
+}
+
+TEST_F(SetTensorAllocationTypeTest,
+       SetUnallocatedPersistentRoTensorToPersistentRoIsANoop) {
+  tensor_.allocation_type = kTfLitePersistentRo;
+  SetTensorToPersistentRo(&tensor_);
+  EXPECT_EQ(tensor_.data.data, nullptr);
+  EXPECT_EQ(tensor_.allocation_type, kTfLitePersistentRo);
+}
+
+TEST_F(SetTensorAllocationTypeTest,
+       SetAllocatedPersistentRoTensorToPersistentRoIsANoop) {
+  tensor_.allocation_type = kTfLitePersistentRo;
+  ASSERT_EQ(context_.ResizeTensor(&context_, &tensor_, dims_.release()),
+            kTfLiteOk);
+  const void* const original_data = tensor_.data.data;
+  SetTensorToPersistentRo(&tensor_);
+  EXPECT_EQ(tensor_.data.data, original_data);
+  EXPECT_EQ(tensor_.allocation_type, kTfLitePersistentRo);
+}
+
+TEST_F(SetTensorAllocationTypeTest,
+       SetAllocatedDynamicTensorToPersistentRoFreesExistingTensorData) {
+  tensor_.allocation_type = kTfLiteDynamic;
+  ASSERT_EQ(context_.ResizeTensor(&context_, &tensor_, dims_.release()),
+            kTfLiteOk);
+
+  // Leak checker will raise an error if data is not freed.
+  SetTensorToPersistentRo(&tensor_);
+  EXPECT_EQ(tensor_.data.data, nullptr);
+  EXPECT_EQ(tensor_.allocation_type, kTfLitePersistentRo);
 }
 
 }  // namespace

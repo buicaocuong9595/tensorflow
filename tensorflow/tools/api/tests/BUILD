@@ -7,6 +7,7 @@ load(
 )
 
 package(
+    # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
     default_visibility = ["//tensorflow/tools/api:__subpackages__"],
     licenses = ["notice"],
 )
@@ -35,14 +36,17 @@ py_test(
         "no_windows",  # Bugs due to some paths.
     ],
     deps = [
+        "@six_archive//:six",
+        # copybara:uncomment "//third_party/py/tensorflow:tensorflow_compat_v1_estimator",
+        # copybara:uncomment "//third_party/py/tensorflow:tensorflow_compat_v2_estimator",
         "//tensorflow:tensorflow_py",
         "//tensorflow/python:client_testlib",
         "//tensorflow/python:lib",
-        "//tensorflow/python:platform",
+        "//tensorflow/python/platform:resource_loader",
+        "//tensorflow/python/platform:tf_logging",
         "//tensorflow/tools/api/lib:python_object_to_proto_visitor",
         "//tensorflow/tools/common:public_api",
         "//tensorflow/tools/common:traverse",
-        "@six_archive//:six",
     ],
 )
 

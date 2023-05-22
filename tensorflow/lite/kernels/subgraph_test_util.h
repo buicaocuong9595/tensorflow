@@ -23,11 +23,13 @@ limitations under the License.
 #include <stdint.h>
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
+#include "tensorflow/lite/core/interpreter.h"
 #include "tensorflow/lite/core/subgraph.h"
-#include "tensorflow/lite/interpreter.h"
+#include "tensorflow/lite/interpreter_test_util.h"
 
 namespace tflite {
 namespace subgraph_test_util {
@@ -76,7 +78,7 @@ class SubgraphBuilder {
   //   Equivalent to (counter, value) -> (counter + 1, tf.pad(value, padding))
   // Note the padding is created as a constant tensor.
   void BuildPadLoopBodySubgraph(Subgraph* subgraph,
-                                const std::vector<int> padding);
+                                const std::vector<int>& padding);
 
   // Build a subgraph with a single While op.
   // 2 inputs, 2 outputs.
@@ -121,18 +123,15 @@ class SubgraphBuilder {
   std::vector<void*> buffers_;
 };
 
-class ControlFlowOpTest : public ::testing::Test {
+class ControlFlowOpTest : public InterpreterTest {
  public:
-  ControlFlowOpTest()
-      : interpreter_(new Interpreter), builder_(new SubgraphBuilder) {}
+  ControlFlowOpTest() : builder_(new SubgraphBuilder) {}
 
   ~ControlFlowOpTest() override {
-    interpreter_.reset();
     builder_.reset();
   }
 
  protected:
-  std::unique_ptr<Interpreter> interpreter_;
   std::unique_ptr<SubgraphBuilder> builder_;
 };
 
@@ -164,6 +163,10 @@ void CheckIntTensor(const TfLiteTensor* tensor, const std::vector<int>& shape,
 // Check if the shape and bool data of a tensor is as expected.
 void CheckBoolTensor(const TfLiteTensor* tensor, const std::vector<int>& shape,
                      const std::vector<bool>& data);
+
+// Sets the tensor to be readable and writable. Call this on input
+// tensors when constructing Subgraphs to test.
+void SetupTensor(Subgraph* subgraph, int tensor_index, TfLiteType type);
 
 }  // namespace subgraph_test_util
 }  // namespace tflite

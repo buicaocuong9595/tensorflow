@@ -20,55 +20,53 @@ limitations under the License.
 #include <random>
 #include <string>
 
-#include "tensorflow/compiler/xla/service/hlo_module.h"
+#include "tensorflow/compiler/xla/hlo/ir/hlo_module.h"
 #include "tensorflow/compiler/xla/service/hlo_runner.h"
 #include "tensorflow/compiler/xla/tools/run_hlo_module.pb.h"
-#include "tensorflow/core/platform/status.h"
+#include "tensorflow/tsl/platform/status.h"
 
 namespace xla {
 
 // Command-line options to this tool.  See main() in run_hlo_module_main.cc for
 // descriptions of these fields.
 struct RunHloModuleOptions {
-  RunHloModuleOptions()
-      : platform(""),
-        reference_platform("default"),
-        print_literals(false),
-        flatten_control_flow(false),
-        run_test_hlo_passes(true),
-        run_reference_hlo_passes(true),
-        // Using small float range by default, as otherwise all reductions
-        // miscompare vs. the interpreter with inf/nan.
-        use_large_float_range(false),
-        abs_error_bound(1e-3),
-        rel_error_bound(1e-3),
-        input_format("hlo"),
-        input_module(""),
-        iterations(1),
-        output_literals_file(""),
-        input_literals_file("") {}
   std::string platform;
-  std::string reference_platform;
-  bool print_literals;
-  bool flatten_control_flow;
-  bool run_test_hlo_passes;
-  bool run_reference_hlo_passes;
-  bool use_large_float_range;
-  float abs_error_bound;
-  float rel_error_bound;
+  std::string reference_platform{"default"};
+  bool print_literals{false};
+  bool flatten_control_flow{false};
+  bool run_test_hlo_passes{true};
+  bool run_reference_hlo_passes{true};
+  // Using small float range by default, as otherwise all reductions
+  // miscompare vs. the interpreter with inf/nan.
+  bool use_large_float_range{false};
+  bool treat_gte_as_data_formatting{false};
+  float abs_error_bound{1e-3};
+  float rel_error_bound{1e-3};
   std::string input_format;
   std::string input_module;
-  int iterations;
+  int iterations{1};
   std::string output_literals_file;
   std::string input_literals_file;
+  bool random_init_input_literals{true};
+  bool force_fake_data{false};
 };
 
-// Reads a HloModule from 'hlo_filename', runs it on the platform with the name
+// Runs test_module on the platform with the name
 // 'test_platform_name', and if 'reference_platform_name' is non-empty, it also
 // runs it on the platform with the name 'reference_platform_name' and compares
 // the results. 'reference_module_modifier_hook' can be used to transform the
 // HloModule before it is run on the reference platform. This may be necessary
 // to match the numerics of the test platform.
+Status RunAndCompare(
+    std::unique_ptr<HloModule> test_module, HloRunnerInterface* test_runner,
+    HloRunnerInterface* reference_runner, std::minstd_rand0* engine,
+    const RunHloModuleOptions& options,
+    xla::RunHloModuleIterationLiterals* iteration_literals_proto = nullptr,
+    std::function<Status(const HloModule&, HloRunnerInterface*, HloModule*)>
+        reference_module_modifier_hook = {},
+    std::function<void(HloModuleConfig*)> config_modifier_hook = {});
+
+// Same as above but reads a HloModule from 'hlo_filename'.
 Status RunAndCompare(
     const std::string& hlo_filename, HloRunnerInterface* test_runner,
     HloRunnerInterface* reference_runner, std::minstd_rand0* engine,
@@ -77,7 +75,6 @@ Status RunAndCompare(
     std::function<Status(const HloModule&, HloRunnerInterface*, HloModule*)>
         reference_module_modifier_hook = {},
     std::function<void(HloModuleConfig*)> config_modifier_hook = {});
-
 }  // namespace xla
 
 #endif  // TENSORFLOW_COMPILER_XLA_TOOLS_RUN_HLO_MODULE_H_

@@ -17,9 +17,12 @@ limitations under the License.
 
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <utility>
 
+#include <gtest/gtest.h>
 #include "absl/memory/memory.h"
+#include "absl/status/status.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_split.h"
 #include "tensorflow/cc/ops/array_ops_internal.h"
@@ -36,8 +39,11 @@ limitations under the License.
 #include "tensorflow/core/common_runtime/graph_constructor.h"
 #include "tensorflow/core/common_runtime/rendezvous_mgr.h"
 #include "tensorflow/core/common_runtime/step_stats_collector.h"
+#include "tensorflow/core/framework/full_type.pb.h"
 #include "tensorflow/core/framework/function.h"
 #include "tensorflow/core/framework/function_testlib.h"
+#include "tensorflow/core/framework/graph_debug_info.pb.h"
+#include "tensorflow/core/framework/metrics.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/op_requires.h"
@@ -69,7 +75,7 @@ Status GetOpSig(const string& op, const OpDef** sig) {
 
 void HasError(const Status& s, const error::Code code, StringPiece substr) {
   EXPECT_EQ(s.code(), code) << s;
-  EXPECT_TRUE(absl::StrContains(s.error_message(), substr))
+  EXPECT_TRUE(absl::StrContains(s.message(), substr))
       << s << ", expected substring " << substr;
 }
 
@@ -164,16 +170,17 @@ class FunctionLibraryRuntimeTest : public ::testing::Test {
     for (const auto& fdef : flib) *(proto.add_function()) = fdef;
     lib_def_.reset(new FunctionLibraryDefinition(OpRegistry::Global(), proto));
     OptimizerOptions opts;
-    device_mgr_ = absl::make_unique<StaticDeviceMgr>(std::move(devices));
+    device_mgr_ = std::make_unique<StaticDeviceMgr>(std::move(devices));
     pflr_.reset(new ProcessFunctionLibraryRuntime(
         device_mgr_.get(), Env::Default(), &options.config,
         TF_GRAPH_DEF_VERSION, lib_def_.get(), opts, /*thread_pool=*/nullptr,
         /*parent=*/nullptr, /*session_metadata=*/nullptr,
-        Rendezvous::Factory{
-            [](const int64_t, const DeviceMgr* device_mgr, Rendezvous** r) {
-              *r = new IntraProcessRendezvous(device_mgr);
-              return Status::OK();
-            }}));
+        Rendezvous::Factory{[](const int64_t, const DeviceMgr* device_mgr,
+                               tsl::core::RefCountPtr<Rendezvous>* r) {
+          *r = tsl::core::RefCountPtr<Rendezvous>(
+              new IntraProcessRendezvous(device_mgr));
+          return OkStatus();
+        }}));
     flr0_ = pflr_->GetFLR("/job:localhost/replica:0/task:0/cpu:0");
     flr1_ = pflr_->GetFLR("/job:localhost/replica:0/task:0/cpu:1");
     flr2_ = pflr_->GetFLR("/job:localhost/replica:0/task:0/cpu:2");
@@ -203,7 +210,7 @@ class FunctionLibraryRuntimeTest : public ::testing::Test {
     for (size_t i = 0; i < rets.size(); ++i) {
       *rets[i] = out[i];
     }
-    return Status::OK();
+    return OkStatus();
   }
 
   Status Instantiate(FunctionLibraryRuntime* flr, const string& name,
@@ -247,10 +254,10 @@ class FunctionLibraryRuntimeTest : public ::testing::Test {
     if (!status.ok()) return status;
 
     Status status2 = Run(flr, handle, opts, args, std::move(rets));
-    EXPECT_TRUE(errors::IsNotFound(status2))
+    EXPECT_TRUE(absl::IsNotFound(status2))
         << "Actual status: " << status2.ToString();
-    EXPECT_TRUE(absl::StrContains(status2.error_message(), "Handle"));
-    EXPECT_TRUE(absl::StrContains(status2.error_message(), "not found"));
+    EXPECT_TRUE(absl::StrContains(status2.message(), "Handle"));
+    EXPECT_TRUE(absl::StrContains(status2.message(), "not found"));
 
     return status;
   }
@@ -273,7 +280,7 @@ class FunctionLibraryRuntimeTest : public ::testing::Test {
       return status;
     }
 
-    return Status::OK();
+    return OkStatus();
   }
 
   Status InstantiateAndRunViaCallFrameInterface(FunctionLibraryRuntime* flr,
@@ -306,9 +313,9 @@ class FunctionLibraryRuntimeTest : public ::testing::Test {
     if (!status.ok()) return status;
 
     Status status2 = Run(flr, handle, opts, args, std::move(rets));
-    EXPECT_TRUE(errors::IsNotFound(status2));
-    EXPECT_TRUE(absl::StrContains(status2.error_message(), "Handle"));
-    EXPECT_TRUE(absl::StrContains(status2.error_message(), "not found"));
+    EXPECT_TRUE(absl::IsNotFound(status2));
+    EXPECT_TRUE(absl::StrContains(status2.message(), "Handle"));
+    EXPECT_TRUE(absl::StrContains(status2.message(), "not found"));
 
     return status;
   }
@@ -384,6 +391,10 @@ TEST_F(FunctionLibraryRuntimeTest, InstantiationStackTraceCopying) {
     }
 
     StackFrame LastUserFrame() const override { return StackFrame{}; }
+
+    std::vector<StackFrame> GetUserFrames(int limit) const override {
+      return {};
+    }
   };
 
   FunctionDef func = test::function::XTimesTwo();
@@ -438,7 +449,7 @@ class ConsumeArgumentCallFrame : public CallFrameInterface {
   Status SetRetval(int index, const Tensor& val) override {
     CHECK_EQ(index, 0);
     *retval_ = val;
-    return Status::OK();
+    return OkStatus();
   }
 
  private:
@@ -448,6 +459,8 @@ class ConsumeArgumentCallFrame : public CallFrameInterface {
 
 TEST_F(FunctionLibraryRuntimeTest, XTimesTwo_ConsumeArgument_DefaultExecutor) {
   Init({test::function::XTimesTwo()});
+  auto default_executor = metrics::TestDelta("flr_executor", "default");
+  auto single_threaded = metrics::TestDelta("flr_executor", "single_threaded");
   FunctionLibraryRuntime::Handle handle;
   TF_CHECK_OK(flr0_->Instantiate(
       "XTimesTwo", test::function::Attrs({{"T", DT_FLOAT}}), &handle));
@@ -469,11 +482,15 @@ TEST_F(FunctionLibraryRuntimeTest, XTimesTwo_ConsumeArgument_DefaultExecutor) {
   EXPECT_FALSE(x.IsInitialized());
 
   TF_CHECK_OK(flr0_->ReleaseHandle(handle));
+  EXPECT_GT(default_executor.Get(), 0);
+  EXPECT_EQ(single_threaded.Get(), 0);
 }
 
 TEST_F(FunctionLibraryRuntimeTest,
        XTimesTwo_ConsumeArgument_SingleThreadedExecutor) {
   Init({test::function::XTimesTwo()});
+  auto default_executor = metrics::TestDelta("flr_executor", "default");
+  auto single_threaded = metrics::TestDelta("flr_executor", "single_threaded");
   FunctionLibraryRuntime::InstantiateOptions instantiate_opts;
   instantiate_opts.executor_type = "SINGLE_THREADED_EXECUTOR";
   FunctionLibraryRuntime::Handle handle;
@@ -498,6 +515,8 @@ TEST_F(FunctionLibraryRuntimeTest,
   EXPECT_FALSE(x.IsInitialized());
 
   TF_CHECK_OK(flr0_->ReleaseHandle(handle));
+  EXPECT_EQ(default_executor.Get(), 0);
+  EXPECT_GT(single_threaded.Get(), 0);
 }
 
 TEST_F(FunctionLibraryRuntimeTest, XTimesN) {
@@ -1021,7 +1040,7 @@ TEST_F(FunctionLibraryRuntimeTest,
   //   c = NoOp(^b)
   //   ret = RetVal(b, ^c)
   const auto init_graph = [this](std::unique_ptr<Graph>* g) -> void {
-    *g = absl::make_unique<Graph>(OpRegistry::Global());
+    *g = std::make_unique<Graph>(OpRegistry::Global());
 
     Scope s = Scope::NewRootScope();
     TF_ASSERT_OK(s.graph()->AddFunctionLibrary(fdef_lib_));
@@ -1109,7 +1128,7 @@ TEST_F(FunctionLibraryRuntimeTest, ExpandInlineFunctionsAndKeepCallerNode) {
     auto a = ops::_Arg(s.WithOpName("a"), DT_FLOAT, 0);
     auto b = test::function::Call(&s, "b", "AddAndMul", {a});
     TF_RETURN_IF_ERROR(s.ToGraph(g->get()));
-    return Status::OK();
+    return OkStatus();
   };
 
   const string input_node = "Func/b/input/_0";
@@ -1138,7 +1157,7 @@ TEST_F(FunctionLibraryRuntimeTest, ExpandInlineFunctionsAndKeepCallerNode) {
   {
     opts.native_options.keep_caller_node = KeepCallerNode::kFetchable;
 
-    std::unique_ptr<Graph> g = absl::make_unique<Graph>(OpRegistry::Global());
+    std::unique_ptr<Graph> g = std::make_unique<Graph>(OpRegistry::Global());
     TF_ASSERT_OK(construct_graph(&g));
 
     ExpandInlineFunctions(flr0_, g.get(), opts);
@@ -1157,7 +1176,7 @@ TEST_F(FunctionLibraryRuntimeTest, ExpandInlineFunctionsAndKeepCallerNode) {
   {
     opts.native_options.keep_caller_node = KeepCallerNode::kTargetable;
 
-    std::unique_ptr<Graph> g = absl::make_unique<Graph>(OpRegistry::Global());
+    std::unique_ptr<Graph> g = std::make_unique<Graph>(OpRegistry::Global());
     TF_ASSERT_OK(construct_graph(&g));
 
     ExpandInlineFunctions(flr0_, g.get(), opts);
@@ -1197,7 +1216,7 @@ TEST_F(FunctionLibraryRuntimeTest, ExpandInlineFunctionsAndPlaceInlinedNodes) {
     for (Node* node : (*g)->op_nodes()) {
       if (node->name() == "b") node->set_requested_device(call_device);
     }
-    return Status::OK();
+    return OkStatus();
   };
 
   const string input_node = "Func/b/input/_0";
@@ -1228,7 +1247,7 @@ TEST_F(FunctionLibraryRuntimeTest, ExpandInlineFunctionsAndPlaceInlinedNodes) {
     opts.native_options.inlined_function_body_placer =
         InlinedFunctionBodyPlacer::Default();
 
-    auto g = absl::make_unique<Graph>(OpRegistry::Global());
+    auto g = std::make_unique<Graph>(OpRegistry::Global());
     TF_ASSERT_OK(construct_graph(&g));
 
     ExpandInlineFunctions(flr0_, g.get(), opts);
@@ -1249,7 +1268,7 @@ TEST_F(FunctionLibraryRuntimeTest, ExpandInlineFunctionsAndPlaceInlinedNodes) {
     opts.native_options.inlined_function_body_placer =
         InlinedFunctionBodyPlacer::SingleDevice();
 
-    auto g = absl::make_unique<Graph>(OpRegistry::Global());
+    auto g = std::make_unique<Graph>(OpRegistry::Global());
     TF_ASSERT_OK(construct_graph(&g));
 
     ExpandInlineFunctions(flr0_, g.get(), opts);
@@ -1270,7 +1289,7 @@ TEST_F(FunctionLibraryRuntimeTest, ExpandInlineFunctionsAndPlaceInlinedNodes) {
     opts.native_options.inlined_function_body_placer =
         InlinedFunctionBodyPlacer::MultiDevice();
 
-    auto g = absl::make_unique<Graph>(OpRegistry::Global());
+    auto g = std::make_unique<Graph>(OpRegistry::Global());
     TF_ASSERT_OK(construct_graph(&g));
 
     const string merged_device = "/job:body/replica:0/task:1/device:CPU:*";
@@ -1393,51 +1412,18 @@ TEST_F(FunctionLibraryRuntimeTest, DoNotPruneControlOutputsFromBody) {
   EXPECT_EQ(expected_node_names, executed_node_names);
 }
 
-// Constant folding generates names using a global counter.
-// This function invokes constant folding and parses the counter
-// from the generated node name.
-int GetConstantFoldingCounter() {
-  Graph g(OpRegistry::Global());
-  Scope s = Scope::NewRootScope();
-  auto a = ops::Const<float>(s, {1.0}, {});
-  auto b = ops::Const<float>(s, {2.0}, {});
-
-  auto add = ops::Add(s.WithOpName("add"), a, b);
-  auto send =
-      ops::_Send(s.WithOpName("s1"), add, "add", "sender", 0, "receiver");
-
-  TF_CHECK_OK(s.ToGraph(&g));
-  bool was_mutated;
-  ConstantFoldingOptions opt{};
-  TF_CHECK_OK(
-      ConstantFold(opt, nullptr, Env::Default(), nullptr, &g, &was_mutated));
-  GraphDef def;
-  g.ToGraphDef(&def);
-  for (const NodeDef& node : def.node()) {
-    if (absl::StartsWith(node.name(), "add/")) {
-      std::vector<std::string> v = absl::StrSplit(node.name(), "__cf__");
-      CHECK_GT(v.size(), 1);
-      int counter;
-      CHECK(absl::SimpleAtoi(v[v.size() - 1], &counter));
-      return counter;
-    }
-  }
-  LOG(FATAL) << "Should have found a node that replaced add";
-}
-
 TEST_F(FunctionLibraryRuntimeTest, OptimizeGraph) {
   Init({test::function::XTimesTwo(), test::function::XTimesFour(),
         test::function::XTimes16()});
   std::unique_ptr<Graph> g = GetFuncBody(flr0_, "XTimes16", {{"T", DT_FLOAT}});
   ASSERT_TRUE(g != nullptr);
   ExpandInlineFunctions(flr0_, g.get());
-  int cf_counter = GetConstantFoldingCounter();
   OptimizeGraph(flr0_, &g);
   {
     Scope s = Scope::NewRootScope();
     auto x = ops::_Arg(s.WithOpName("x"), DT_FLOAT, 0);
     auto x4_x2_scale = ops::Const<float>(
-        s.WithOpName("x4/x2/scale/_12__cf__" + std::to_string(cf_counter + 1))
+        s.WithOpName("x4/x2/scale/_12__cf__0")
             .WithDevice("/job:localhost/replica:0/task:0/device:CPU:0"),
         2.0f);
     auto x4_x2_y = ops::Mul(s.WithOpName("x4/x2/y"), x, x4_x2_scale);
@@ -1648,20 +1634,19 @@ TEST_F(FunctionLibraryRuntimeTest, Gradient_XTimesTwo) {
     TF_EXPECT_GRAPH_EQ(expected, actual);
   }
 
-  int cf_counter = GetConstantFoldingCounter();
   OptimizeGraph(flr0_, &g);
   {
     Scope s = Scope::NewRootScope();
     auto x = ops::_Arg(s.WithOpName("x"), DT_FLOAT, 0);
     auto func0 = ops::_Arg(s.WithOpName("Func/_0"), DT_FLOAT, 1);
     auto scale = ops::Const(
-        s.WithOpName("scale/_6__cf__" + std::to_string(cf_counter + 2))
+        s.WithOpName("scale/_6__cf__1")
             .WithDevice("/job:localhost/replica:0/task:0/device:CPU:0"),
         2.0f);
     auto func1_gx = ops::Mul(s.WithOpName("Func/_1/gx"), func0, scale);
     auto func1_sx = ops::Shape(s.WithOpName("Func/_1/sx"), x);
     auto const0 = ops::Const(
-        s.WithOpName("Func/_1/sy/_5__cf__" + std::to_string(cf_counter + 1))
+        s.WithOpName("Func/_1/sy/_5__cf__0")
             .WithDevice("/job:localhost/replica:0/task:0/device:CPU:0"),
         0, {0});
     auto func1_rx = ops::internal::BroadcastGradientArgs(
@@ -2041,6 +2026,43 @@ TEST_F(FunctionLibraryRuntimeTest, RunAllKernelsInline) {
     Tensor result;
     TF_ASSERT_OK(Run(flr0_, handle, opts, {}, {&result}));
     EXPECT_EQ(result.scalar<bool>()(), inline_option);
+  }
+}
+
+TEST_F(FunctionLibraryRuntimeTest, FullTypeForInt32) {
+  auto T = DT_INT32;
+  FunctionDef int32_func = FDH::Define(
+      // Name
+      "DoubleInt32",
+      // Args
+      {"x: int32"},
+      // Return values
+      {"z: int32"},
+      // Attrs
+      {},
+      // Nodes
+      {// z = Add<T>(x, x)
+       {{"z"}, "Add", {"x", "x"}, {{"T", T}}}});
+  Init({int32_func});
+
+  auto x = test::AsTensor<int32>({1, 2, 3, 4});
+  auto y = test::AsTensor<float>({1.0, 2.0, 3.0, 4.0});
+  Tensor z;
+
+  FunctionLibraryRuntime::Handle handle;
+  TF_CHECK_OK(Instantiate(flr0_, "DoubleInt32", {}, &handle));
+
+  const FunctionBody* fb = flr0_->GetFunctionBody(handle);
+  for (const Node* node : fb->arg_nodes) {
+    if (node->name() == "x") {
+      ASSERT_TRUE(node->def().has_experimental_type());
+      FullTypeDef ft = node->def().experimental_type();
+      EXPECT_EQ(ft.type_id(), TFT_PRODUCT);
+      ASSERT_EQ(ft.args_size(), 1);
+      EXPECT_EQ(ft.args(0).type_id(), TFT_SHAPE_TENSOR);
+      ASSERT_EQ(ft.args(0).args_size(), 1);
+      EXPECT_EQ(ft.args(0).args(0).type_id(), TFT_INT32);
+    }
   }
 }
 
@@ -2428,6 +2450,137 @@ TEST(OptimizationTest, RemoveListArrayConverter_WithControlDeps) {
   // NOTE: We are not removing Identity nodes with any control
   // dependencies yet.
   TF_EXPECT_GRAPH_EQ(expected, Optimize(remove_listarray_and_identity, func));
+}
+
+class TestStackTrace : public AbstractStackTrace {
+ public:
+  explicit TestStackTrace(const std::vector<StackFrame>& frames)
+      : frames_(frames) {}
+
+  absl::Span<StackFrame const> ToFrames() const override { return frames_; }
+  std::vector<StackFrame> ToUncachedFrames() const override { return frames_; }
+
+  StackFrame LastUserFrame() const override { return frames_.back(); }
+
+  std::vector<StackFrame> GetUserFrames(int limit) const override {
+    return frames_;
+  }
+
+  string ToString(const TracePrintingOptions& opts) const override {
+    return "";
+  }
+
+  std::vector<StackFrame> frames_;
+};
+
+TEST(StackTracesMapToGraphDebugInfoTest, EmptyMap) {
+  StackTracesMap map;
+  GraphDebugInfo generated = StackTracesMapToGraphDebugInfo(map);
+
+  EXPECT_EQ(generated.files_size(), 0);
+  EXPECT_EQ(generated.traces_size(), 0);
+}
+
+TEST(StackTracesMapToGraphDebugInfoTest, EmptyFrames) {
+  StackTracesMap map;
+  std::vector<StackFrame> frames;
+  auto stack_trace = std::make_shared<TestStackTrace>(frames);
+  map.insert({"dummy_name", stack_trace});
+  GraphDebugInfo generated = StackTracesMapToGraphDebugInfo(map);
+
+  EXPECT_EQ(generated.files_size(), 0);
+  EXPECT_EQ(generated.traces_size(), 1);
+  EXPECT_EQ(generated.traces().at("dummy_name").file_line_cols().size(), 0);
+}
+
+TEST(StackTracesMapToGraphDebugInfoTest, OneFrame) {
+  StackTracesMap map;
+  std::vector<StackFrame> frames = {
+      StackFrame({"dummy_file_name", 10, "dummy_function_name"})};
+  auto stack_trace = std::make_shared<TestStackTrace>(frames);
+  map.insert({"dummy_name", stack_trace});
+  GraphDebugInfo generated = StackTracesMapToGraphDebugInfo(map);
+
+  EXPECT_EQ(generated.files_size(), 1);
+  EXPECT_EQ(generated.files()[0], "dummy_file_name");
+
+  EXPECT_EQ(generated.traces_size(), 1);
+  EXPECT_EQ(generated.traces().at("dummy_name").file_line_cols().size(), 1);
+  EXPECT_EQ(
+      generated.traces().at("dummy_name").file_line_cols()[0].file_index(), 0);
+  EXPECT_EQ(generated.traces().at("dummy_name").file_line_cols()[0].line(), 10);
+  EXPECT_EQ(generated.traces().at("dummy_name").file_line_cols()[0].func(),
+            "dummy_function_name");
+}
+
+TEST(StackTracesMapToGraphDebugInfoTest, TwoFramesSameFile) {
+  StackTracesMap map;
+  std::vector<StackFrame> frames = {
+      StackFrame({"dummy_file_name", 10, "dummy_function_name"}),
+      StackFrame({"dummy_file_name", 20, "other_function_name"})};
+  auto stack_trace = std::make_shared<TestStackTrace>(frames);
+  map.insert({"dummy_name", stack_trace});
+  GraphDebugInfo generated = StackTracesMapToGraphDebugInfo(map);
+
+  EXPECT_EQ(generated.files_size(), 1);
+  EXPECT_EQ(generated.files()[0], "dummy_file_name");
+
+  EXPECT_EQ(generated.traces_size(), 1);
+  EXPECT_EQ(generated.traces().at("dummy_name").file_line_cols().size(), 2);
+
+  EXPECT_EQ(
+      generated.traces().at("dummy_name").file_line_cols()[0].file_index(), 0);
+  EXPECT_EQ(generated.traces().at("dummy_name").file_line_cols()[0].line(), 10);
+  EXPECT_EQ(generated.traces().at("dummy_name").file_line_cols()[0].func(),
+            "dummy_function_name");
+
+  EXPECT_EQ(
+      generated.traces().at("dummy_name").file_line_cols()[1].file_index(), 0);
+  EXPECT_EQ(generated.traces().at("dummy_name").file_line_cols()[1].line(), 20);
+  EXPECT_EQ(generated.traces().at("dummy_name").file_line_cols()[1].func(),
+            "other_function_name");
+}
+
+TEST(StackTracesMapToGraphDebugInfoTest, TwoFramesDifferentFile) {
+  StackTracesMap map;
+  std::vector<StackFrame> frames = {
+      StackFrame({"dummy_file_name", 10, "dummy_function_name"}),
+      StackFrame({"other_file_name", 20, "other_function_name"})};
+  auto stack_trace = std::make_shared<TestStackTrace>(frames);
+  map.insert({"dummy_name", stack_trace});
+  GraphDebugInfo generated = StackTracesMapToGraphDebugInfo(map);
+
+  EXPECT_EQ(generated.files_size(), 2);
+  EXPECT_EQ(generated.files()[0], "dummy_file_name");
+  EXPECT_EQ(generated.files()[1], "other_file_name");
+
+  EXPECT_EQ(generated.traces_size(), 1);
+  EXPECT_EQ(generated.traces().at("dummy_name").file_line_cols().size(), 2);
+
+  EXPECT_EQ(
+      generated.traces().at("dummy_name").file_line_cols()[0].file_index(), 0);
+  EXPECT_EQ(generated.traces().at("dummy_name").file_line_cols()[0].line(), 10);
+  EXPECT_EQ(generated.traces().at("dummy_name").file_line_cols()[0].func(),
+            "dummy_function_name");
+
+  EXPECT_EQ(
+      generated.traces().at("dummy_name").file_line_cols()[1].file_index(), 1);
+  EXPECT_EQ(generated.traces().at("dummy_name").file_line_cols()[1].line(), 20);
+  EXPECT_EQ(generated.traces().at("dummy_name").file_line_cols()[1].func(),
+            "other_function_name");
+}
+
+TEST(StackTracesTest, ToFrames) {
+  StackTracesMap map;
+  std::vector<StackFrame> frames = {
+      StackFrame({"dummy_file_name", 10, "dummy_function_name"}),
+      StackFrame({"other_file_name", 20, "other_function_name"})};
+  auto stack_trace = TestStackTrace(frames);
+  EXPECT_EQ(stack_trace.ToFrames().size(), 2);
+  auto uncached_frames = stack_trace.ToUncachedFrames();
+  EXPECT_EQ(uncached_frames.size(), 2);
+  EXPECT_EQ(frames[0], uncached_frames[0]);
+  EXPECT_EQ(frames[1], uncached_frames[1]);
 }
 
 }  // namespace

@@ -19,7 +19,9 @@ limitations under the License.
 #include <stddef.h>
 #include <stdint.h>
 
+#include "tensorflow/c/c_api_macros.h"
 #include "tensorflow/c/tf_attrtype.h"
+#include "tensorflow/c/tf_buffer.h"
 #include "tensorflow/c/tf_datatype.h"
 #include "tensorflow/c/tf_status.h"
 #include "tensorflow/c/tf_tensor.h"
@@ -71,59 +73,14 @@ limitations under the License.
 //   and the API just provides high level controls over the number of
 //   devices of each type.
 
-// Macro to control visibility of exported symbols in the shared library (.so,
-// .dylib, .dll).
-// This duplicates the TF_EXPORT macro definition in
-// tensorflow/core/platform/macros.h in order to keep this .h file independent
-// of any other includes.
-#ifdef SWIG
-#define TF_CAPI_EXPORT
-#else
-#if defined(_WIN32)
-#ifdef TF_COMPILE_LIBRARY
-#define TF_CAPI_EXPORT __declspec(dllexport)
-#else
-#define TF_CAPI_EXPORT __declspec(dllimport)
-#endif  // TF_COMPILE_LIBRARY
-#else
-#define TF_CAPI_EXPORT __attribute__((visibility("default")))
-#endif  // _WIN32
-#endif  // SWIG
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 // --------------------------------------------------------------------------
 // TF_Version returns a string describing version information of the
-// TensorFlow library. TensorFlow using semantic versioning.
+// TensorFlow library. TensorFlow uses semantic versioning.
 TF_CAPI_EXPORT extern const char* TF_Version(void);
-
-// --------------------------------------------------------------------------
-// TF_Buffer holds a pointer to a block of data and its associated length.
-// Typically, the data consists of a serialized protocol buffer, but other data
-// may also be held in a buffer.
-//
-// By default, TF_Buffer itself does not do any memory management of the
-// pointed-to block.  If need be, users of this struct should specify how to
-// deallocate the block by setting the `data_deallocator` function pointer.
-typedef struct TF_Buffer {
-  const void* data;
-  size_t length;
-  void (*data_deallocator)(void* data, size_t length);
-} TF_Buffer;
-
-// Makes a copy of the input and sets an appropriate deallocator.  Useful for
-// passing in read-only, input protobufs.
-TF_CAPI_EXPORT extern TF_Buffer* TF_NewBufferFromString(const void* proto,
-                                                        size_t proto_len);
-
-// Useful for passing *out* a protobuf.
-TF_CAPI_EXPORT extern TF_Buffer* TF_NewBuffer(void);
-
-TF_CAPI_EXPORT extern void TF_DeleteBuffer(TF_Buffer*);
-
-TF_CAPI_EXPORT extern TF_Buffer TF_GetBuffer(TF_Buffer* buffer);
 
 // Parsing a serialized TensorProto into a TF_Tensor.
 TF_CAPI_EXPORT extern void TF_TensorFromProto(const TF_Buffer* from,
@@ -177,7 +134,7 @@ typedef struct TF_Graph TF_Graph;
 // Return a new graph object.
 TF_CAPI_EXPORT extern TF_Graph* TF_NewGraph(void);
 
-// Destroy an options object.  Graph will be deleted once no more
+// Destroy an options object. Graph will be deleted once no more
 // TFSession's are referencing it.
 TF_CAPI_EXPORT extern void TF_DeleteGraph(TF_Graph*);
 
@@ -664,7 +621,7 @@ TF_CAPI_EXPORT extern void TF_OperationGetAttrShapeList(
     int num_shapes, int64_t* storage, int storage_size, TF_Status* status);
 
 // Sets `value` to the binary-serialized TensorShapeProto of the value of
-// `attr_name` attribute of `oper`'.
+// `attr_name` attribute of `oper`.
 TF_CAPI_EXPORT extern void TF_OperationGetAttrTensorShapeProto(
     TF_Operation* oper, const char* attr_name, TF_Buffer* value,
     TF_Status* status);
@@ -1080,7 +1037,7 @@ TF_CAPI_EXPORT void TF_AddGradientsWithPrefix(TF_Graph* g, const char* prefix,
 //              the nodes in the graph (except for the automatic skipping, see
 //              below).
 //  opers - Array of operations to become the body of the function or null.
-//          - If no array is given (`num_opers`  = -1), all the
+//          - If no array is given (`num_opers` = -1), all the
 //          operations in `fn_body` will become part of the function
 //          except operations referenced in `inputs`. These operations
 //          must have a single output (these operations are typically

@@ -23,19 +23,19 @@ limitations under the License.
 #include <vector>
 
 #include "absl/types/span.h"
+#include "tensorflow/compiler/xla/hlo/ir/hlo_computation.h"
+#include "tensorflow/compiler/xla/hlo/ir/hlo_module.h"
 #include "tensorflow/compiler/xla/service/backend.h"
 #include "tensorflow/compiler/xla/service/compiler.h"
 #include "tensorflow/compiler/xla/service/computation_placer.h"
 #include "tensorflow/compiler/xla/service/executable.h"
-#include "tensorflow/compiler/xla/service/hlo_computation.h"
-#include "tensorflow/compiler/xla/service/hlo_module.h"
 #include "tensorflow/compiler/xla/service/hlo_runner_interface.h"
 #include "tensorflow/compiler/xla/status_macros.h"
 #include "tensorflow/compiler/xla/statusor.h"
+#include "tensorflow/compiler/xla/stream_executor/stream_executor.h"
 #include "tensorflow/compiler/xla/types.h"
 #include "tensorflow/compiler/xla/util.h"
 #include "tensorflow/compiler/xla/xla_data.pb.h"
-#include "tensorflow/core/platform/stream_executor_no_cuda.h"
 
 namespace xla {
 
@@ -56,7 +56,8 @@ class HloRunner : public HloRunnerInterface {
   ~HloRunner() override;
 
   // Transfers data between the host and device.
-  StatusOr<ScopedShapedBuffer> TransferLiteralToDevice(const Literal& literal);
+  StatusOr<ScopedShapedBuffer> TransferLiteralToDevice(const Literal& literal,
+                                                       int64_t param_no);
   StatusOr<std::vector<ScopedShapedBuffer>> TransferLiteralsToDevice(
       absl::Span<const Literal* const> literals);
   StatusOr<std::vector<ScopedShapedBuffer>> TransferLiteralsToDevice(
@@ -84,6 +85,12 @@ class HloRunner : public HloRunnerInterface {
 
   // As Execute(), but accepts and returns device buffers instead of host
   // buffers.
+  //
+  // ExecuteWithMovedDeviceBuffers is more memory-safe, but it consumes the
+  // arguments. Please consider using that.
+  //
+  // This may overwrite the values of the arguments if the the module has
+  // aliasing.
   StatusOr<ExecutionOutput> ExecuteWithDeviceBuffers(
       std::unique_ptr<HloModule> module,
       absl::Span<ScopedShapedBuffer const> arguments,
@@ -91,6 +98,20 @@ class HloRunner : public HloRunnerInterface {
 
   StatusOr<ExecutionOutput> ExecuteWithDeviceBuffers(
       Executable* executable, absl::Span<ScopedShapedBuffer const> arguments,
+      ExecutionProfile* profile = nullptr);
+
+  // As Execute(), but accepts and returns device buffers instead of host
+  // buffers.
+  //
+  // This is a memory-safer version of ExecuteWithDeviceBuffers, but it consumes
+  // the arguments.
+  StatusOr<ExecutionOutput> ExecuteWithMovedDeviceBuffers(
+      std::unique_ptr<HloModule> module,
+      std::vector<ScopedShapedBuffer> arguments, bool run_hlo_passes = true,
+      ExecutionProfile* profile = nullptr);
+
+  StatusOr<ExecutionOutput> ExecuteWithMovedDeviceBuffers(
+      Executable* executable, std::vector<ScopedShapedBuffer> arguments,
       ExecutionProfile* profile = nullptr);
 
   // Creates an executable object given an HLO module. If run_hlo_passes is
@@ -129,7 +150,8 @@ class HloRunner : public HloRunnerInterface {
       std::function<Executable*(int64_t)> executable_provider,
       std::function<int64_t(int64_t)> argument_count_provider,
       std::function<const Literal*(int64_t, int64_t)> argument_provider,
-      const ReplicatedExecuteOptions& options);
+      const ReplicatedExecuteOptions& options,
+      DeviceAssignment* device_assignment = nullptr);
 
   // If backend is not created in the constructor, creates and returns the
   // default backend. If creation fails, crashes the program.
@@ -141,7 +163,15 @@ class HloRunner : public HloRunnerInterface {
 
   absl::string_view Name() const override;
 
+  DeviceShapeRepresentationFn device_shape_representation_fn() {
+    return device_shape_representation_fn_;
+  }
+
  private:
+  StatusOr<ExecutionOutput> ExecuteWithExecutionInputs(
+      Executable* executable, std::vector<ExecutionInput> arguments,
+      ExecutionProfile* profile);
+
   // Creates a ServiceExecutableRunOptions object to configure a run on device,
   // using the provided stream object. If device_assignment is not nullptr, it
   // will be used to configure the replication parameters. Replicated executions
@@ -164,6 +194,8 @@ class HloRunner : public HloRunnerInterface {
   std::unique_ptr<Backend> backend_;
 
   DeviceShapeRepresentationFn device_shape_representation_fn_;
+
+  const ComputationLayout* entry_computation_layout_ = nullptr;
 };
 
 }  // namespace xla

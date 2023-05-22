@@ -17,8 +17,8 @@ limitations under the License.
 #include <string>
 #include <vector>
 
-#include "pybind11/pybind11.h"
-#include "pybind11/stl.h"
+#include "pybind11/pybind11.h"  // from @pybind11
+#include "pybind11/stl.h"  // from @pybind11
 #include "tensorflow/core/lib/core/error_codes.pb.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/status.h"
@@ -231,6 +231,16 @@ PYBIND11_MODULE(_pywrap_file_io, m) {
         return self.release();
       },
       py::arg("filename"), py::arg("token") = (PyTransactionToken*)nullptr);
+
+  m.def("GetRegisteredSchemes", []() {
+    std::vector<std::string> results;
+    py::gil_scoped_release release;
+    const auto status =
+        tensorflow::Env::Default()->GetRegisteredFileSystemSchemes(&results);
+    pybind11::gil_scoped_acquire acquire;
+    tensorflow::MaybeRaiseRegisteredFromStatus(status);
+    return results;
+  });
 
   using tensorflow::WritableFile;
   py::class_<WritableFile>(m, "WritableFile")

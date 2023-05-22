@@ -14,7 +14,7 @@
 # ==============================================================================
 """Tests for core."""
 
-import collections
+import collections.abc
 import os
 import pickle
 import threading
@@ -42,6 +42,7 @@ from tensorflow.python.ops import nn_ops
 from tensorflow.python.ops import resource_variable_ops
 from tensorflow.python.ops import script_ops
 from tensorflow.python.ops import variables
+from tensorflow.python.platform import tf_logging
 
 
 def execute(op_name, num_outputs, inputs, attrs=None):
@@ -71,6 +72,7 @@ def configure_virtual_cpus():
   ])
 
 
+@test_util.with_eager_op_as_function
 class TFETest(test_util.TensorFlowTestCase):
 
   def setUp(self):
@@ -80,11 +82,11 @@ class TFETest(test_util.TensorFlowTestCase):
 
   def _test_hashable(self, a, b, hashable):
     if hashable:
-      self.assertIsInstance(b, collections.Hashable)
+      self.assertIsInstance(b, collections.abc.Hashable)
       self.assertLen(set([a, b]), 2)
     else:
       # TODO(gjn): Figure out how to make this work for tf.Tensor
-      # self.assertNotIsInstance(b, collections.Hashable)
+      # self.assertNotIsInstance(b, collections.abc.Hashable)
       with self.assertRaisesRegex(TypeError, 'unhashable'):
         set([a, b])
 
@@ -112,7 +114,7 @@ class TFETest(test_util.TensorFlowTestCase):
       constant_b = constant_op.constant(1.0)
 
       ops.disable_tensor_equality()
-      self._test_hashable(constant_a, constant_b, True)
+      self._test_hashable(constant_a, constant_b, False)
       _v1_check(constant_a, constant_b)
       ops.enable_tensor_equality()
       _v2_check(constant_a, constant_b)
@@ -163,7 +165,7 @@ class TFETest(test_util.TensorFlowTestCase):
       constant_b = constant_op.constant(float('nan'))
 
       ops.disable_tensor_equality()
-      self._test_hashable(constant_a, constant_b, True)
+      self._test_hashable(constant_a, constant_b, False)
       _v1_check(constant_a, constant_b)
       ops.enable_tensor_equality()
       _v2_check(constant_a, constant_b)
@@ -300,8 +302,12 @@ class TFETest(test_util.TensorFlowTestCase):
       with self.assertRaises(ValueError):
         bool(tf_a == tf_d)
       self.assertAllEqual(tf_a == tf_d, [[True, False], [True, False]])
-      self.assertFalse(bool(tf_a == tf_e))
-      self.assertTrue(bool(tf_a != tf_e))
+
+      # TODO(b/207402791): re-enable once incompatible shapes supported by XLA.
+      if not test_util.is_xla_enabled():
+        self.assertFalse(bool(tf_a == tf_e))
+        self.assertTrue(bool(tf_a != tf_e))
+
       self.assertNotAllEqual(tf_a, tf_e)
 
       with self.assertRaises(ValueError):
@@ -864,6 +870,7 @@ class TFETest(test_util.TensorFlowTestCase):
           attrs=('T', dtypes.float32.as_datatype_enum, 'squeeze_dims',
                  ['0', '2']))
 
+  @test_util.disable_eager_op_as_function('b/206994108')
   def testExecuteListTypeListShapeAttr(self):
     execute(
         b'Barrier',
@@ -1060,6 +1067,7 @@ class TFETest(test_util.TensorFlowTestCase):
         empty_handle.shape.as_list())
 
 
+@test_util.with_eager_op_as_function
 class SendRecvTest(test_util.TensorFlowTestCase):
 
   cpu_device = '/job:localhost/replica:0/task:0/device:CPU:0'
@@ -1138,6 +1146,52 @@ class EagerTensorCacheTest(test_util.TensorFlowTestCase):
 
     cache.put('2', array_ops.zeros((2)))
     self.assertIsNotNone(cache.get('2'))
+
+
+class StatusToExceptionTest(test.TestCase):
+
+  def testStatusToException(self):
+    with test.mock.patch.object(
+        tf_logging, 'error_log', autospec=True
+    ) as mock_error_log:
+      # define input to _status_to_exception
+      error_message = 'Test Message'
+      test_class_code = errors.UNIMPLEMENTED
+      test_class_code_to_exception = errors.exception_type_from_error_code(
+          test_class_code
+      )
+      error = core._NotOkStatusException(error_message, test_class_code, None)
+      # call to _status_to_exception
+      exception = core._status_to_exception(error)
+      # validate return value
+      self.assertEqual(error_message, exception.message)
+      self.assertEqual(
+          test_class_code_to_exception.__name__,
+          exception.__class__.__name__,
+      )
+      # verify call to error log library
+      mock_error_log.assert_called_with(str(error))
+
+  def testStatusToExceptionUnknownError(self):
+    with test.mock.patch.object(
+        tf_logging, 'error_log', autospec=True
+    ) as mock_error_log:
+      # define input to _status_to_exception
+      error_message = 'Test Message'
+      invalid_class_code = 1000
+      error = core._NotOkStatusException(
+          error_message, invalid_class_code, None
+      )
+      # call to _status_to_exception
+      exception = core._status_to_exception(error)
+      # validate return value
+      self.assertEqual(error_message, exception.message)
+      self.assertEqual(
+          errors.UnknownError.__name__,
+          exception.__class__.__name__,
+      )
+      # verify call to error log library
+      mock_error_log.assert_called_with(str(error))
 
 
 if __name__ == '__main__':

@@ -15,7 +15,7 @@ limitations under the License.
 
 #include "tensorflow/compiler/xla/service/gather_expander.h"
 
-#include "tensorflow/compiler/xla/service/hlo_query.h"
+#include "tensorflow/compiler/xla/hlo/utils/hlo_query.h"
 #include "tensorflow/compiler/xla/test.h"
 #include "tensorflow/compiler/xla/tests/hlo_test_base.h"
 #include "tensorflow/compiler/xla/tests/test_macros.h"
@@ -26,7 +26,7 @@ namespace {
 using GatherExpanderTest = HloTestBase;
 
 TEST_F(GatherExpanderTest, ErrorStatusOnTooManyIndices) {
-  const string hlo_text = R"(
+  const std::string hlo_text = R"(
 HloModule TensorFlowGatherMultipleBatchDims
 
 ENTRY main {
@@ -46,16 +46,16 @@ ENTRY main {
   Status status = GatherExpander{GatherExpander::kEliminateAllGathers}
                       .Run(module.get())
                       .status();
-  EXPECT_EQ(status.code(), tensorflow::error::UNIMPLEMENTED);
+  EXPECT_EQ(status.code(), tsl::error::UNIMPLEMENTED);
 
   ASSERT_THAT(
-      status.error_message(),
+      status.message(),
       ::testing::HasSubstr("Gather operations with more than 2147483647 gather "
                            "indices are not supported."));
 }
 
 TEST_F(GatherExpanderTest, AvoidDegenerateDims) {
-  const string hlo_text = R"(
+  const std::string hlo_text = R"(
 HloModule TensorFlowGatherV2
 
 ENTRY main {
@@ -115,7 +115,7 @@ ENTRY main {
 }
 
 TEST_F(GatherExpanderTest, CheckOpMetadata) {
-  const string hlo_text = R"(
+  const std::string hlo_text = R"(
 HloModule TensorFlowGatherV2
 
 ENTRY main {
@@ -156,7 +156,7 @@ ENTRY main {
 }
 
 TEST_F(GatherExpanderTest, EliminateSimpleGathersSkipsNontrivialGather) {
-  const string hlo_text = R"(
+  const std::string hlo_text = R"(
 HloModule TensorFlowGatherV1
 
 ENTRY main {
@@ -179,7 +179,7 @@ ENTRY main {
 }
 
 TEST_F(GatherExpanderTest, EliminateSimpleGathersRewritesTrivialGather) {
-  const string hlo_text = R"(
+  const std::string hlo_text = R"(
 HloModule test
 
 ENTRY main {
@@ -201,6 +201,33 @@ ENTRY main {
   ASSERT_TRUE(changed);
   ASSERT_FALSE(hlo_query::ContainsInstrWithOpcode(module->entry_computation(),
                                                   {HloOpcode::kGather}));
+}
+
+TEST_F(GatherExpanderTest, GatherIsBroadcast) {
+  const std::string hlo_text = R"(
+HloModule test
+
+ENTRY main {
+  operand = s32[1,3] parameter(0)
+  indices = s32[7,5] parameter(1)
+  ROOT gather = s32[7,3,5] gather(operand, indices),
+      offset_dims={1},
+      collapsed_slice_dims={0},
+      start_index_map={0},
+      index_vector_dim=2,
+      slice_sizes={1,3}
+}
+)";
+
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo_text));
+  GatherExpander pass(GatherExpander::kEliminateSimpleGathers);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&pass, module.get()));
+  ASSERT_TRUE(changed);
+  ASSERT_FALSE(hlo_query::ContainsInstrWithOpcode(module->entry_computation(),
+                                                  {HloOpcode::kGather}));
+  ASSERT_TRUE(hlo_query::ContainsInstrWithOpcode(module->entry_computation(),
+                                                 {HloOpcode::kBroadcast}));
+  module->VerifyOrAddFailure("after-gather-expander.");
 }
 
 }  // namespace

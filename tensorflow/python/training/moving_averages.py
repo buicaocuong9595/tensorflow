@@ -14,15 +14,16 @@
 # ==============================================================================
 """Maintain moving averages of parameters."""
 from tensorflow.python.distribute import distribute_lib
-from tensorflow.python.distribute import distribution_strategy_context
 from tensorflow.python.distribute import reduce_util as ds_reduce_util
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
+from tensorflow.python.ops import cond
 from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.ops import init_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import state_ops
 from tensorflow.python.ops import variable_scope
+from tensorflow.python.ops import variable_v1
 from tensorflow.python.ops import variables
 from tensorflow.python.training import slot_creator
 from tensorflow.python.util.tf_export import tf_export
@@ -67,7 +68,7 @@ def assign_moving_average(variable, value, decay, zero_debias=True, name=None):
   Args:
     variable: A Variable.
     value: A tensor with the same shape as 'variable'.
-    decay: A float Tensor or float value.  The moving average decay.
+    decay: A float `Tensor` or float value. The moving average decay.
     zero_debias: A python bool. If true, assume the variable is 0-initialized
       and unbias it, as in (Kingma et al., 2015). See docstring in
         `_zero_debias` for more details.
@@ -96,7 +97,7 @@ def assign_moving_average(variable, value, decay, zero_debias=True, name=None):
       else:
         return _update(strategy, v, update_fn, args=(value,))
 
-    replica_context = distribution_strategy_context.get_replica_context()
+    replica_context = distribute_lib.get_replica_context()
     if replica_context:
       # In a replica context, we update variable using the mean of value across
       # replicas.
@@ -107,7 +108,7 @@ def assign_moving_average(variable, value, decay, zero_debias=True, name=None):
 
       return replica_context.merge_call(merge_fn, args=(variable, value))
     else:
-      strategy = distribution_strategy_context.get_cross_replica_context()
+      strategy = distribute_lib.get_cross_replica_context()
       return update(strategy, variable, value)
 
 
@@ -128,7 +129,7 @@ def weighted_moving_average(value,
 
   Args:
     value: A numeric `Tensor`.
-    decay: A float `Tensor` or float value.  The moving average decay.
+    decay: A float `Tensor` or float value. The moving average decay.
     weight:  `Tensor` that keeps the current value of a weight. Shape should be
       able to multiply `value`.
     truediv:  Boolean, if `True`, dividing by `moving_average(weight)` is
@@ -177,7 +178,7 @@ def weighted_moving_average(value,
 
 def _update(strategy, var, update_fn, args):
   """Applies updates depending on the context."""
-  assert distribution_strategy_context.in_cross_replica_context(), (
+  assert distribute_lib.in_cross_replica_context(), (
       "_update can only be called in cross-replica context")
   if distribute_lib.get_update_replica_id() is not None:
     # Call update_fn on var to delegate the implementation. We expect `var` will
@@ -279,7 +280,7 @@ def _zero_debias(strategy, unbiased_var, value, decay):
 
 
 @tf_export("train.ExponentialMovingAverage")
-class ExponentialMovingAverage(object):
+class ExponentialMovingAverage:
   """Maintains moving averages of variables by employing an exponential decay.
 
   When training a model, it is often beneficial to maintain moving averages of
@@ -306,10 +307,11 @@ class ExponentialMovingAverage(object):
   file.
 
   The moving averages are computed using exponential decay.  You specify the
-  decay value when creating the `ExponentialMovingAverage` object.  The shadow
-  variables are initialized with the same initial values as the trained
-  variables.  When you run `apply` to maintain the moving averages, each
-  shadow variable is updated with the formula:
+  decay value (as a scalar float value, `Tensor`, or `Variable`) when creating
+  the `ExponentialMovingAverage` object.  The shadow variables are initialized
+  with the same initial values as the trained variables.  When you run `apply`
+  to update the moving averages, each shadow variable is updated with the
+  formula:
 
     `shadow_variable -= (1 - decay) * (shadow_variable - variable)`
 
@@ -321,6 +323,10 @@ class ExponentialMovingAverage(object):
 
   Reasonable values for `decay` are close to 1.0, typically in the
   multiple-nines range: 0.999, 0.9999, etc.
+
+  To have fine-grained control over the value of the decay parameter during
+  training, pass a scalar `tf.Variable` as the `decay` value to the constructor,
+  and update the variable as needed.
 
   Example usage when creating a training model:
 
@@ -464,7 +470,7 @@ class ExponentialMovingAverage(object):
       `min(decay, (1 + num_updates) / (10 + num_updates))`
 
     Args:
-      decay: Float.  The decay to use.
+      decay: A scalar float value, `Tensor`, or `Variable`. The decay parameter.
       num_updates: Optional count of number of updates applied to variables.
       zero_debias: If `True`, zero debias moving-averages that are initialized
         with tensors. (Note: moving averages may not be initialized with
@@ -545,7 +551,9 @@ class ExponentialMovingAverage(object):
         with ops.init_scope():
           if isinstance(var, variables.Variable):
             with ops.device(var.device):
-              initialized_value = var.initialized_value()
+              initialized_value = cond.cond(
+                  variable_v1.is_variable_initialized(var), var.read_value,
+                  lambda: var.initial_value)  # pylint: disable=cell-var-from-loop
             avg = slot_creator.create_slot(
                 var,
                 initialized_value,

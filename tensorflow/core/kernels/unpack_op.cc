@@ -32,7 +32,6 @@ namespace tensorflow {
 typedef Eigen::ThreadPoolDevice CPUDevice;
 typedef Eigen::GpuDevice GPUDevice;
 
-
 template <typename Device, typename T>
 class UnpackOp : public OpKernel {
  public:
@@ -138,28 +137,26 @@ TF_CALL_ALL_TYPES(REGISTER_UNPACK);
       Name("Unpack").Device(DEVICE_GPU).TypeConstraint<type>("T"), \
       UnpackOp<GPUDevice, type>)
 
-TF_CALL_bfloat16(REGISTER_GPU);
 TF_CALL_uint8(REGISTER_GPU);
 TF_CALL_GPU_ALL_TYPES(REGISTER_GPU);
 #undef REGISTER_GPU
 
-// A special GPU kernel for int32.
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+
+// A special DEVICE_DEFAULT kernel for int32.
 // TODO(b/25387198): Also enable int32 in device memory. This kernel
 // registration requires all int32 inputs and outputs to be in host memory.
 REGISTER_KERNEL_BUILDER(Name("Unpack")
-                            .Device(DEVICE_GPU)
+                            .Device(DEVICE_DEFAULT)
                             .HostMemory("value")
                             .HostMemory("output")
                             .TypeConstraint<int32>("T"),
                         UnpackOp<CPUDevice, int32>);
 REGISTER_KERNEL_BUILDER(Name("Unpack")
-                            .Device(DEVICE_GPU)
+                            .Device(DEVICE_DEFAULT)
                             .HostMemory("value")
                             .HostMemory("output")
                             .TypeConstraint<int64_t>("T"),
                         UnpackOp<CPUDevice, int64>);
-
-#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
-
 
 }  // end namespace tensorflow

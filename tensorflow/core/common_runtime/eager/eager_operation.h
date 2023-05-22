@@ -37,7 +37,7 @@ namespace tensorflow {
 class EagerOperation : public ImmediateExecutionOperation {
  public:
   explicit EagerOperation(tensorflow::EagerContext* ctx)
-      : ImmediateExecutionOperation(kEager), ctx_(*ctx) {}
+      : ImmediateExecutionOperation(kEager), ctx_(*ctx), is_function_(false) {}
   ~EagerOperation() override {
     for (ImmediateExecutionTensorHandle* h : inputs_) {
       h->Unref();
@@ -140,8 +140,8 @@ class EagerOperation : public ImmediateExecutionOperation {
 
   Status Reset(const char* op, const char* device_name, bool remote,
                EagerExecutor* executor,
-               const absl::optional<EagerRemoteFunctionParams>
-                   remote_func_params = absl::nullopt);
+               const absl::optional<EagerFunctionParams> remote_func_params =
+                   absl::nullopt);
 
   bool is_function() const { return is_function_; }
   bool colocation_exempt() const { return colocation_exempt_; }
@@ -166,6 +166,13 @@ class EagerOperation : public ImmediateExecutionOperation {
 
   void UpdateInput(int i, TensorHandle* h);
 
+  // This is useful if we want the EagerOperation to point to a different
+  // function.
+  void UpdateName(const string& name) {
+    op_name_ = name.c_str();
+    attrs_.set_op_name(name);
+  }
+
   // Like TensorHandles, EagerOperations may be placed either on a virtual
   // CustomDevice or on a physical Device.
   VariantDevice Device() const { return device_; }
@@ -182,12 +189,35 @@ class EagerOperation : public ImmediateExecutionOperation {
     cancellation_manager_ = cancellation_manager;
   }
 
+  // Assign step_id value only if op has valid step id.
+  // When eager_func_params.has_value() returns true, we can directly overwrite
+  // its step id according to Op's step id (if not default value). However, when
+  // eager_func_params.has_value() returns false, we need to first create a new
+  // EagerFuncParams object for it before assigning step_id; otherwise,
+  // directly assigning step_id in this case leaves eager_func_params to be
+  // in a weird state where:
+  // (1) eager_func_params.has_value() returns false, but
+  // (2) eager_func_params->step_id.has_value() returns true.
+  void SetStepId(int64_t step_id) override {
+    assert(is_function());
+    if (step_id != EagerContext::kGlobalRendezvousId) {
+      if (eager_func_params_.has_value()) {
+        eager_func_params_->step_id = step_id;
+      } else {
+        eager_func_params_ = EagerFunctionParams{
+            kInvalidOpId, /*is_component_function=*/false, step_id};
+      }
+    } else {
+      LOG(WARNING) << "SetStepId() should not receive a gloabl rendezvous id.";
+    }
+  }
+
   EagerExecutor& Executor() { return *executor_; }
 
   string DebugString() const;
 
-  const absl::optional<EagerRemoteFunctionParams>& remote_func_params() const {
-    return remote_func_params_;
+  const absl::optional<EagerFunctionParams>& eager_func_params() const {
+    return eager_func_params_;
   }
 
   // Op name recorded for memory debugging purpose.
@@ -253,7 +283,8 @@ class EagerOperation : public ImmediateExecutionOperation {
   bool colocation_exempt_;
   CancellationManager* cancellation_manager_ = nullptr;  // Not owned.
   EagerExecutor* executor_;                              // Not owned.
-  absl::optional<EagerRemoteFunctionParams> remote_func_params_;
+
+  absl::optional<EagerFunctionParams> eager_func_params_;
 
   // Inference information
   const tensorflow::OpDef* op_def_;  // op definition from protobuf

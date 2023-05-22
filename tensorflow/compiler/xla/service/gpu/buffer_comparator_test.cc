@@ -16,13 +16,16 @@ limitations under the License.
 #include "tensorflow/compiler/xla/service/gpu/buffer_comparator.h"
 
 #include <complex>
+#include <cstdint>
 #include <limits>
 #include <string>
 
 #include "tensorflow/compiler/xla/primitive_util.h"
+#include "tensorflow/compiler/xla/service/gpu/stream_executor_util.h"
+#include "tensorflow/compiler/xla/shape_util.h"
+#include "tensorflow/compiler/xla/stream_executor/device_memory.h"
 #include "tensorflow/compiler/xla/types.h"
-#include "tensorflow/core/platform/test.h"
-#include "tensorflow/stream_executor/device_memory.h"
+#include "tensorflow/tsl/platform/test.h"
 
 namespace xla {
 namespace gpu {
@@ -31,9 +34,8 @@ namespace {
 class BufferComparatorTest : public testing::Test {
  protected:
   BufferComparatorTest()
-      : platform_(
-            se::MultiPlatformManager::PlatformWithName("cuda").ValueOrDie()),
-        stream_exec_(platform_->ExecutorForDevice(0).ValueOrDie()) {}
+      : platform_(se::MultiPlatformManager::PlatformWithName("cuda").value()),
+        stream_exec_(platform_->ExecutorForDevice(0).value()) {}
 
   // Take floats only for convenience. Still uses ElementType internally.
   template <typename ElementType>
@@ -56,8 +58,7 @@ class BufferComparatorTest : public testing::Test {
             primitive_util::NativeToPrimitiveType<ElementType>(),
             {static_cast<int64_t>(lhs_buffer->ElementCount())}),
         HloModuleConfig());
-    return comparator.CompareEqual(&stream, *lhs_buffer, *rhs_buffer)
-        .ConsumeValueOrDie();
+    return comparator.CompareEqual(&stream, *lhs_buffer, *rhs_buffer).value();
   }
 
   // Take floats only for convenience. Still uses ElementType internally.
@@ -179,12 +180,12 @@ TEST_F(BufferComparatorTest, TestNumbers) {
   EXPECT_TRUE(CompareEqualFloatBuffers<double>({9}, {10}));
   EXPECT_TRUE(CompareEqualFloatBuffers<double>({10}, {9}));
 
-  EXPECT_TRUE(CompareEqualFloatBuffers<int8>({100}, {101}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<int8>({0}, {10}));
-  EXPECT_TRUE(CompareEqualFloatBuffers<int8>({9}, {10}));
-  EXPECT_TRUE(CompareEqualFloatBuffers<int8>({90}, {100}));
-  EXPECT_TRUE(CompareEqualFloatBuffers<int8>({100}, {90}));
-  EXPECT_FALSE(CompareEqualFloatBuffers<int8>({-128}, {127}));
+  EXPECT_TRUE(CompareEqualFloatBuffers<int8_t>({100}, {101}));
+  EXPECT_FALSE(CompareEqualFloatBuffers<int8_t>({0}, {10}));
+  EXPECT_TRUE(CompareEqualFloatBuffers<int8_t>({9}, {10}));
+  EXPECT_TRUE(CompareEqualFloatBuffers<int8_t>({90}, {100}));
+  EXPECT_TRUE(CompareEqualFloatBuffers<int8_t>({100}, {90}));
+  EXPECT_FALSE(CompareEqualFloatBuffers<int8_t>({-128}, {127}));
 }
 
 TEST_F(BufferComparatorTest, TestMultiple) {
@@ -240,21 +241,42 @@ TEST_F(BufferComparatorTest, TestMultiple) {
   }
 
   {
-    EXPECT_TRUE(CompareEqualFloatBuffers<int8>({20, 30, 40, 50, 60},
-                                               {21, 31, 41, 51, 61}));
+    EXPECT_TRUE(CompareEqualFloatBuffers<int8_t>({20, 30, 40, 50, 60},
+                                                 {21, 31, 41, 51, 61}));
     std::vector<float> lhs(200);
     std::vector<float> rhs(200);
     for (int i = 0; i < 200; i++) {
-      EXPECT_TRUE(CompareEqualFloatBuffers<int8>(lhs, rhs))
+      EXPECT_TRUE(CompareEqualFloatBuffers<int8_t>(lhs, rhs))
           << "should be the same at index " << i;
       lhs[i] = 3;
       rhs[i] = 5;
-      EXPECT_FALSE(CompareEqualFloatBuffers<int8>(lhs, rhs))
+      EXPECT_FALSE(CompareEqualFloatBuffers<int8_t>(lhs, rhs))
           << "should be the different at index " << i;
       lhs[i] = 0;
       rhs[i] = 0;
     }
   }
+}
+
+TEST_F(BufferComparatorTest, BF16) {
+  const int element_count = 3123;
+  int64_t rng_state = 0;
+
+  se::Stream stream(stream_exec_);
+  stream.Init();
+
+  se::ScopedDeviceMemory<Eigen::bfloat16> lhs =
+      stream_exec_->AllocateOwnedArray<Eigen::bfloat16>(element_count);
+  InitializeBuffer(&stream, BF16, &rng_state, *lhs.ptr());
+
+  se::ScopedDeviceMemory<Eigen::bfloat16> rhs =
+      stream_exec_->AllocateOwnedArray<Eigen::bfloat16>(element_count);
+  InitializeBuffer(&stream, BF16, &rng_state, *rhs.ptr());
+
+  BufferComparator comparator(ShapeUtil::MakeShape(BF16, {element_count}),
+                              HloModuleConfig());
+  EXPECT_FALSE(
+      comparator.CompareEqual(&stream, *lhs.ptr(), *rhs.ptr()).value());
 }
 
 }  // namespace

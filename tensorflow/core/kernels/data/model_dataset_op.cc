@@ -29,7 +29,6 @@ limitations under the License.
 #include "tensorflow/core/lib/random/random.h"
 #include "tensorflow/core/platform/cpu_info.h"
 #include "tensorflow/core/platform/stringprintf.h"
-#include "tensorflow/core/util/ptr_util.h"
 
 namespace tensorflow {
 namespace data {
@@ -63,9 +62,7 @@ class ModelDatasetOp::Dataset : public DatasetBase {
         cpu_budget_(cpu_budget),
         ram_budget_(ram_budget),
         traceme_metadata_(
-            {{"algorithm", algorithm == model::AutotuneAlgorithm::HILL_CLIMB
-                               ? "hill climb"
-                               : "gradient descent"},
+            {{"algorithm", model::AutotuneAlgorithm_Name(algorithm)},
              {"cpu_budget",
               strings::Printf("%lld", static_cast<long long>(cpu_budget))},
              {"ram_budget",
@@ -77,7 +74,7 @@ class ModelDatasetOp::Dataset : public DatasetBase {
 
   std::unique_ptr<IteratorBase> MakeIteratorInternal(
       const string& prefix) const override {
-    return absl::make_unique<Iterator>(
+    return std::make_unique<Iterator>(
         Iterator::Params{this, strings::StrCat(prefix, "::Model")});
   }
 
@@ -90,11 +87,13 @@ class ModelDatasetOp::Dataset : public DatasetBase {
 
   string DebugString() const override { return "ModelDatasetOp::Dataset"; }
 
-  int64_t Cardinality() const override { return input_->Cardinality(); }
+  int64_t CardinalityInternal(CardinalityOptions options) const override {
+    return input_->Cardinality(options);
+  }
 
   Status InputDatasets(std::vector<const DatasetBase*>* inputs) const override {
     inputs->push_back(input_);
-    return Status::OK();
+    return OkStatus();
   }
 
   Status CheckExternalState() const override {
@@ -120,7 +119,7 @@ class ModelDatasetOp::Dataset : public DatasetBase {
                        std::make_pair(kCpuBudget, cpu_budget_attr),
                        std::make_pair(kRamBudget, ram_budget_attr)},
                       output));
-    return Status::OK();
+    return OkStatus();
   }
 
  private:
@@ -133,7 +132,7 @@ class ModelDatasetOp::Dataset : public DatasetBase {
           ram_budget_(dataset()->ram_budget_ == 0
                           ? kRamBudgetShare * port::AvailableRam()
                           : dataset()->ram_budget_) {
-      cancellation_manager_ = absl::make_unique<CancellationManager>();
+      cancellation_manager_ = std::make_unique<CancellationManager>();
       model_ = std::make_shared<model::Model>();
     }
 
@@ -198,18 +197,18 @@ class ModelDatasetOp::Dataset : public DatasetBase {
           }
         });
       }
-      return Status::OK();
+      return OkStatus();
     }
 
     mutex mu_;
     std::shared_ptr<model::Model> model_;
+    std::unique_ptr<IteratorBase> input_impl_;
+    const int64_t cpu_budget_;
+    const int64_t ram_budget_;
     // Controls cancellation of `model_thread_`. Must be ordered before
     // `model_thread_` so that `model_thread_` is destroyed first.
     std::unique_ptr<CancellationManager> cancellation_manager_;
     std::unique_ptr<Thread> model_thread_ TF_GUARDED_BY(mu_);
-    std::unique_ptr<IteratorBase> input_impl_;
-    const int64_t cpu_budget_;
-    const int64_t ram_budget_;
   };
 
   const DatasetBase* input_;

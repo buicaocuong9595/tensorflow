@@ -31,15 +31,19 @@ from tensorflow.python.eager import monitoring
 from tensorflow.python.framework import device
 from tensorflow.python.framework import error_interpolation
 from tensorflow.python.framework import errors
+from tensorflow.python.framework import indexed_slices
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import sparse_tensor
+from tensorflow.python.framework import stack
 from tensorflow.python.ops import session_ops
 from tensorflow.python.platform import tf_logging as logging
 from tensorflow.python.training.experimental import mixed_precision_global_state
 from tensorflow.python.util import compat
+from tensorflow.python.util import deprecation
 from tensorflow.python.util import nest
 from tensorflow.python.util.compat import collections_abc
 from tensorflow.python.util.tf_export import tf_export
+
 
 _python_session_create_counter = monitoring.Counter(
     '/tensorflow/api/python/session_create_counter',
@@ -73,7 +77,7 @@ class SessionInterface(object):
 
 
 def _get_indexed_slices_value_from_fetches(fetched_vals):
-  return ops.IndexedSlicesValue(
+  return indexed_slices.IndexedSlicesValue(
       fetched_vals[0], fetched_vals[1],
       fetched_vals[2] if len(fetched_vals) == 3 else None)
 
@@ -119,7 +123,7 @@ _REGISTERED_EXPANSIONS = [
      lambda feed: [feed.indices, feed.values, feed.dense_shape]),
     # IndexedSlices are fetched as IndexedSlicesValues. They can be fed
     # IndexedSlicesValues or normal tuples.
-    (ops.IndexedSlices,
+    (indexed_slices.IndexedSlices,
      lambda fetch: ([fetch.values, fetch.indices] if fetch.dense_shape is None
                     else [fetch.values, fetch.indices, fetch.dense_shape
                          ], _get_indexed_slices_value_from_fetches),
@@ -707,7 +711,8 @@ class BaseSession(SessionInterface):
     opts = tf_session.TF_NewSessionOptions(target=self._target, config=config)
     try:
       # pylint: disable=protected-access
-      self._session = tf_session.TF_NewSessionRef(self._graph._c_graph, opts)
+      with self._graph._c_graph.get() as c_graph:
+        self._session = tf_session.TF_NewSessionRef(c_graph, opts)
       # pylint: enable=protected-access
     finally:
       tf_session.TF_DeleteSessionOptions(opts)
@@ -852,7 +857,7 @@ class BaseSession(SessionInterface):
     Returns:
       A context manager using this session as the default session.
     """
-    return ops.default_session(self)
+    return stack.default_session(self)
 
   def run(self, fetches, feed_dict=None, options=None, run_metadata=None):
     """Runs operations and evaluates tensors in `fetches`.
@@ -975,8 +980,18 @@ class BaseSession(SessionInterface):
         tf_session.TF_DeleteBuffer(options_ptr)
     return result
 
+  @deprecation.deprecated(
+      '2023-06-01',
+      'This function is deprecated and we do not expect adding new'
+      'functionality to it. Please do not have your code depending'
+      'on this function.',
+  )
   def partial_run(self, handle, fetches, feed_dict=None):
     """Continues the execution with more feeds and fetches.
+
+    NOTE: This function is deprecated and we do not expect adding new
+    functionality to it. Please do not have your code depending on this
+    function.
 
     This is EXPERIMENTAL and subject to change.
 
@@ -1022,8 +1037,18 @@ class BaseSession(SessionInterface):
     # TODO(touts): Support feeding and fetching the same tensor.
     return self._run(handle, fetches, feed_dict, None, None)
 
+  @deprecation.deprecated(
+      '2023-06-01',
+      'This function is deprecated and we do not expect adding new'
+      'functionality to it. Please do not have your code depending'
+      'on this function.',
+  )
   def partial_run_setup(self, fetches, feeds=None):
     """Sets up a graph with feeds and fetches for partial run.
+
+    NOTE: This function is deprecated and we do not expect adding new
+    functionality to it. Please do not have your code depending on this
+    function.
 
     This is EXPERIMENTAL and subject to change.
 
@@ -1386,7 +1411,7 @@ class BaseSession(SessionInterface):
           node_def = op.node_def
         except KeyError:
           pass
-      message = error_interpolation.interpolate(message, self._graph)
+      message = error_interpolation.interpolate_graph(message, self._graph)
       if 'only supports NHWC tensor format' in message:
         message += ('\nA possible workaround: Try disabling Grappler optimizer'
                     '\nby modifying the config for creating the session eg.'

@@ -16,25 +16,27 @@ limitations under the License.
 #include "tensorflow/compiler/xla/literal_util.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <numeric>
+#include <string>
+#include <type_traits>
 #include <vector>
 
-#include "absl/memory/memory.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "tensorflow/compiler/xla/index_util.h"
+#include "tensorflow/compiler/xla/primitive_util.h"
 #include "tensorflow/compiler/xla/shape_util.h"
 #include "tensorflow/compiler/xla/status_macros.h"
 #include "tensorflow/compiler/xla/types.h"
 #include "tensorflow/compiler/xla/util.h"
-#include "tensorflow/core/lib/core/errors.h"
-#include "tensorflow/core/lib/hash/hash.h"
-#include "tensorflow/core/platform/logging.h"
-#include "tensorflow/core/platform/mem.h"
-#include "tensorflow/core/platform/types.h"
+#include "tensorflow/tsl/platform/errors.h"
+#include "tensorflow/tsl/platform/float8.h"
+#include "tensorflow/tsl/platform/logging.h"
 
 namespace xla {
 namespace {
@@ -80,6 +82,152 @@ Literal ConvertType(LiteralSlice literal) {
   return result;
 }
 
+template <PrimitiveType kType>
+using NativeT = typename primitive_util::PrimitiveTypeToNative<kType>::type;
+
+template <PrimitiveType kType, typename F, typename... Args>
+Literal CreateScalarImpl(F&& value_provider, Args... args) {
+  return LiteralUtil::CreateR0<NativeT<kType>>(
+      value_provider(std::forward<Args>(args)...));
+}
+
+template <template <PrimitiveType> class F, typename... Args>
+Literal CreateScalar(PrimitiveType primitive_type, Args... args) {
+  return primitive_util::PrimitiveTypeSwitch<Literal>(
+      [&](auto primitive_type_constant) -> Literal {
+        if constexpr (primitive_util::IsArrayType(primitive_type_constant)) {
+          return CreateScalarImpl<primitive_type_constant>(
+              F<primitive_type_constant>{}, std::forward<Args>(args)...);
+        }
+        LOG(FATAL) << "Unhandled primitive type " << primitive_type;
+      },
+      primitive_type);
+}
+
+template <PrimitiveType kType>
+struct ZeroProvider {
+  NativeT<kType> operator()() const { return static_cast<NativeT<kType>>(0); }
+};
+
+template <PrimitiveType kType>
+struct OneProvider {
+  NativeT<kType> operator()() const { return static_cast<NativeT<kType>>(1); }
+};
+
+template <typename T>
+struct Is16BitFloat {
+  static constexpr bool value =
+      std::is_same<bfloat16, T>::value || std::is_same<half, T>::value;
+};
+
+template <typename T>
+struct IsReal {
+  static constexpr bool value =
+      std::is_integral<T>::value || std::is_floating_point<T>::value ||
+      std::is_same<bfloat16, T>::value || std::is_same<half, T>::value ||
+      std::is_same<tsl::float8_e5m2, T>::value ||
+      std::is_same<tsl::float8_e4m3fn, T>::value ||
+      std::is_same<tsl::float8_e4m3b11, T>::value;
+};
+
+template <typename T>
+struct IsValidScalarType {
+  static constexpr bool value = IsReal<T>::value ||
+                                std::is_same<complex64, T>::value ||
+                                std::is_same<complex128, T>::value;
+};
+
+template <typename NativeT>
+NativeT GetMaxImpl() {
+  if constexpr (IsReal<NativeT>::value) {
+    if constexpr (std::numeric_limits<NativeT>::has_infinity) {
+      return std::numeric_limits<NativeT>::infinity();
+    }
+    return std::numeric_limits<NativeT>::max();
+  }
+  LOG(FATAL) << "No max value for given type.";
+}
+
+template <typename NativeT>
+NativeT GetMinImpl() {
+  if constexpr (IsReal<NativeT>::value) {
+    if constexpr (std::numeric_limits<NativeT>::has_infinity) {
+      return -std::numeric_limits<NativeT>::infinity();
+    }
+    return std::numeric_limits<NativeT>::lowest();
+  }
+  LOG(FATAL) << "No min value for given type.";
+}
+
+template <PrimitiveType kType>
+struct MaxProvider {
+  NativeT<kType> operator()() const { return GetMaxImpl<NativeT<kType>>(); }
+};
+
+template <PrimitiveType kType>
+struct MinProvider {
+  NativeT<kType> operator()() const { return GetMinImpl<NativeT<kType>>(); }
+};
+
+template <PrimitiveType kType>
+struct FirstElementProvider {
+  NativeT<kType> operator()(const LiteralBase& literal) const {
+    return literal.GetFirstElement<NativeT<kType>>();
+  }
+};
+
+template <typename NativeT>
+std::enable_if_t<IsReal<NativeT>::value, NativeT> GetMaxElementImpl(
+    const LiteralBase& literal) {
+  auto view = literal.data<NativeT>();
+  return *absl::c_max_element(view);
+}
+
+template <typename NativeT>
+std::enable_if_t<!IsReal<NativeT>::value, NativeT> GetMaxElementImpl(
+    const LiteralBase& literal) {
+  LOG(FATAL) << "Unsupported type.";
+}
+
+template <PrimitiveType kType>
+struct MaxElementProvider {
+  NativeT<kType> operator()(const LiteralBase& literal) const {
+    return GetMaxElementImpl<NativeT<kType>>(literal);
+  }
+};
+
+template <typename NativeT>
+std::enable_if_t<IsValidScalarType<NativeT>::value, NativeT>
+GetElementAtIndexImpl(const LiteralBase* literal,
+                      absl::Span<const int64_t> multi_index) {
+  return literal->Get<NativeT>(multi_index);
+}
+
+template <typename NativeT>
+std::enable_if_t<!IsValidScalarType<NativeT>::value, NativeT>
+GetElementAtIndexImpl(const LiteralBase* literal,
+                      absl::Span<const int64_t> multi_index) {
+  LOG(FATAL) << "Not a valid scalar element type.";
+}
+
+template <PrimitiveType kType>
+struct GetElementAtIndexProvider {
+  NativeT<kType> operator()(const LiteralBase* literal,
+                            absl::Span<const int64_t> multi_index) const {
+    DCHECK_EQ(literal->shape().element_type(), kType);
+    return GetElementAtIndexImpl<NativeT<kType>>(literal, multi_index);
+  }
+};
+
+template <PrimitiveType kType>
+void SetScalarAtIndexImpl(MutableLiteralBase& literal,
+                          absl::Span<const int64_t> multi_index,
+                          const LiteralBase& scalar) {
+  DCHECK_EQ(literal.shape().element_type(), kType);
+  using NativeT = typename primitive_util::PrimitiveTypeToNative<kType>::type;
+  literal.Set<NativeT>(multi_index, scalar.Get<NativeT>({}));
+}
+
 }  // namespace
 
 /* static */ Literal LiteralUtil::CreateFromDimensions(
@@ -103,6 +251,11 @@ Literal ConvertType(LiteralSlice literal) {
   return ConvertType<float, bfloat16>(f32_literal);
 }
 
+/* static */ Literal LiteralUtil::ConvertF32ToS8(
+    const LiteralSlice& f32_literal) {
+  return ConvertType<float, int8_t>(f32_literal);
+}
+
 /* static */ Literal LiteralUtil::ConvertF32ToF64(
     const LiteralSlice& f32_literal) {
   return ConvertType<float, double>(f32_literal);
@@ -118,213 +271,56 @@ Literal ConvertType(LiteralSlice literal) {
   return ConvertType<double, float>(f64_literal);
 }
 
+/* static */ Literal LiteralUtil::ConvertS32ToF32(
+    const LiteralSlice& s32_literal) {
+  return ConvertType<int32_t, float>(s32_literal);
+}
+
 /* static */ Literal LiteralUtil::CreateToken() {
   return Literal(ShapeUtil::MakeTokenShape());
 }
 
 /* static */ Literal LiteralUtil::Zero(PrimitiveType primitive_type) {
-  switch (primitive_type) {
-    case U8:
-      return LiteralUtil::CreateR0<uint8>(0);
-    case U16:
-      return LiteralUtil::CreateR0<uint16>(0);
-    case U32:
-      return LiteralUtil::CreateR0<uint32>(0);
-    case U64:
-      return LiteralUtil::CreateR0<uint64_t>(0);
-    case S8:
-      return LiteralUtil::CreateR0<int8>(0);
-    case S16:
-      return LiteralUtil::CreateR0<int16>(0);
-    case S32:
-      return LiteralUtil::CreateR0<int32>(0);
-    case S64:
-      return LiteralUtil::CreateR0<int64_t>(0);
-    case F16:
-      return LiteralUtil::CreateR0<half>(static_cast<half>(0.0f));
-    case BF16:
-      return LiteralUtil::CreateR0<bfloat16>(static_cast<bfloat16>(0.0f));
-    case F32:
-      return LiteralUtil::CreateR0<float>(0);
-    case F64:
-      return LiteralUtil::CreateR0<double>(0);
-    case C64:
-      return LiteralUtil::CreateR0<complex64>(0);
-    case C128:
-      return LiteralUtil::CreateR0<complex128>(0);
-    case PRED:
-      return LiteralUtil::CreateR0<bool>(false);
-    case TUPLE:
-      LOG(FATAL) << "tuple element type cannot take on value of 0";
-    case OPAQUE_TYPE:
-      LOG(FATAL) << "opaque element type cannot take on value of 0";
-    default:
-      LOG(FATAL) << "Unhandled primitive type " << primitive_type;
-  }
+  return CreateScalar<ZeroProvider>(primitive_type);
 }
 
 /* static */ Literal LiteralUtil::One(PrimitiveType primitive_type) {
-  switch (primitive_type) {
-    case U8:
-      return LiteralUtil::CreateR0<uint8>(1);
-    case U16:
-      return LiteralUtil::CreateR0<uint16>(1);
-    case U32:
-      return LiteralUtil::CreateR0<uint32>(1);
-    case U64:
-      return LiteralUtil::CreateR0<uint64_t>(1);
-    case S8:
-      return LiteralUtil::CreateR0<int8>(1);
-    case S16:
-      return LiteralUtil::CreateR0<int16>(1);
-    case S32:
-      return LiteralUtil::CreateR0<int32>(1);
-    case S64:
-      return LiteralUtil::CreateR0<int64_t>(1);
-    case F16:
-      return LiteralUtil::CreateR0<half>(static_cast<half>(1.0f));
-    case BF16:
-      return LiteralUtil::CreateR0<bfloat16>(static_cast<bfloat16>(1.0f));
-    case F32:
-      return LiteralUtil::CreateR0<float>(1);
-    case F64:
-      return LiteralUtil::CreateR0<double>(1);
-    case C64:
-      return LiteralUtil::CreateR0<complex64>(1);
-    case C128:
-      return LiteralUtil::CreateR0<complex128>(1);
-    case PRED:
-      return LiteralUtil::CreateR0<bool>(true);
-    case TUPLE:
-      LOG(FATAL) << "tuple element type cannot take on value of 1";
-    case OPAQUE_TYPE:
-      LOG(FATAL) << "opaque element type cannot take on value of 1";
-    default:
-      LOG(FATAL) << "Unhandled primitive type " << primitive_type;
-  }
+  return CreateScalar<OneProvider>(primitive_type);
 }
 
 /* static */ Literal LiteralUtil::MinValue(PrimitiveType primitive_type) {
-  switch (primitive_type) {
-    case U8:
-      return LiteralUtil::CreateR0<uint8>(std::numeric_limits<uint8>::min());
-    case U16:
-      return LiteralUtil::CreateR0<uint16>(std::numeric_limits<uint16>::min());
-    case U32:
-      return LiteralUtil::CreateR0<uint32>(std::numeric_limits<uint32>::min());
-    case U64:
-      return LiteralUtil::CreateR0<uint64_t>(
-          std::numeric_limits<uint64_t>::min());
-    case S8:
-      return LiteralUtil::CreateR0<int8>(std::numeric_limits<int8>::min());
-    case S16:
-      return LiteralUtil::CreateR0<int16>(std::numeric_limits<int16>::min());
-    case S32:
-      return LiteralUtil::CreateR0<int32>(std::numeric_limits<int32>::min());
-    case S64:
-      return LiteralUtil::CreateR0<int64_t>(
-          std::numeric_limits<int64_t>::min());
-    case F32:
-      return LiteralUtil::CreateR0<float>(
-          -std::numeric_limits<float>::infinity());
-    case F64:
-      return LiteralUtil::CreateR0<double>(
-          -std::numeric_limits<double>::infinity());
-    case C64:
-      LOG(FATAL) << "C64 element type has no minimum value";
-    case C128:
-      LOG(FATAL) << "C128 element type has no minimum value";
-    case PRED:
-      return LiteralUtil::CreateR0<bool>(false);
-    case F16:
-      return LiteralUtil::CreateR0<half>(
-          static_cast<half>(-std::numeric_limits<float>::infinity()));
-    case BF16:
-      return LiteralUtil::CreateR0<bfloat16>(
-          static_cast<bfloat16>(-std::numeric_limits<float>::infinity()));
-    case TUPLE:
-      LOG(FATAL) << "tuple element type has no minimum value";
-    case OPAQUE_TYPE:
-      LOG(FATAL) << "opaque element type has no minimum value";
-    default:
-      LOG(FATAL) << "Unhandled primitive type " << primitive_type;
-  }
+  return CreateScalar<MinProvider>(primitive_type);
 }
 
 /* static */ Literal LiteralUtil::MaxValue(PrimitiveType primitive_type) {
-  switch (primitive_type) {
-    case U8:
-      return LiteralUtil::CreateR0<uint8>(std::numeric_limits<uint8>::max());
-    case U16:
-      return LiteralUtil::CreateR0<uint16>(std::numeric_limits<uint16>::max());
-    case U32:
-      return LiteralUtil::CreateR0<uint32>(std::numeric_limits<uint32>::max());
-    case U64:
-      return LiteralUtil::CreateR0<uint64_t>(
-          std::numeric_limits<uint64_t>::max());
-    case S8:
-      return LiteralUtil::CreateR0<int8>(std::numeric_limits<int8>::max());
-    case S16:
-      return LiteralUtil::CreateR0<int16>(std::numeric_limits<int16>::max());
-    case S32:
-      return LiteralUtil::CreateR0<int32>(std::numeric_limits<int32>::max());
-    case S64:
-      return LiteralUtil::CreateR0<int64_t>(
-          std::numeric_limits<int64_t>::max());
-    case F32:
-      return LiteralUtil::CreateR0<float>(
-          std::numeric_limits<float>::infinity());
-    case F64:
-      return LiteralUtil::CreateR0<double>(
-          std::numeric_limits<double>::infinity());
-    case PRED:
-      return LiteralUtil::CreateR0<bool>(true);
-    case F16:
-      return LiteralUtil::CreateR0<half>(
-          static_cast<half>(std::numeric_limits<float>::infinity()));
-    case BF16:
-      return LiteralUtil::CreateR0<bfloat16>(
-          static_cast<bfloat16>(std::numeric_limits<float>::infinity()));
-    case TUPLE:
-      LOG(FATAL) << "tuple element type has no maximum value";
-    case OPAQUE_TYPE:
-      LOG(FATAL) << "opaque element type has no maximum value";
-    default:
-      LOG(FATAL) << "Unhandled primitive type " << primitive_type;
-  }
+  return CreateScalar<MaxProvider>(primitive_type);
 }
 
 /* static */ StatusOr<Literal> LiteralUtil::NanValue(
     PrimitiveType primitive_type) {
-  switch (primitive_type) {
-    case F16:
-      return LiteralUtil::CreateR0<half>(
-          static_cast<half>(std::numeric_limits<float>::quiet_NaN()));
-    case BF16:
-      return LiteralUtil::CreateR0<bfloat16>(
-          static_cast<bfloat16>(std::numeric_limits<float>::quiet_NaN()));
-    case F32:
-      return LiteralUtil::CreateR0<float>(
-          std::numeric_limits<float>::quiet_NaN());
-    case F64:
-      return LiteralUtil::CreateR0<double>(
-          std::numeric_limits<double>::quiet_NaN());
-    case C64: {
-      float nan = std::numeric_limits<float>::quiet_NaN();
-      return LiteralUtil::CreateR0<complex64>(complex64(nan, nan));
-    }
-    case C128: {
-      double nan = std::numeric_limits<double>::quiet_NaN();
-      return LiteralUtil::CreateR0<complex128>(complex128(nan, nan));
-    }
-    default:
-      return InvalidArgument("Invalid type for NanValue: %s",
-                             PrimitiveType_Name(primitive_type));
-  }
+  return primitive_util::PrimitiveTypeSwitch<StatusOr<Literal>>(
+      [&](auto primitive_type_constant) -> StatusOr<Literal> {
+        if constexpr (primitive_util::IsFloatingPointType(
+                          primitive_type_constant)) {
+          using NativeT = typename primitive_util::PrimitiveTypeToNative<
+              primitive_type_constant>::type;
+          return LiteralUtil::CreateR0<NativeT>(
+              std::numeric_limits<NativeT>::quiet_NaN());
+        }
+        if constexpr (primitive_util::IsComplexType(primitive_type_constant)) {
+          using NativeT = typename primitive_util::PrimitiveTypeToNative<
+              primitive_type_constant>::type;
+          auto nan =
+              std::numeric_limits<typename NativeT::value_type>::quiet_NaN();
+          return LiteralUtil::CreateR0<NativeT>(NativeT(nan, nan));
+        }
+        return InvalidArgument("Invalid type for NanValue: %s",
+                               PrimitiveType_Name(primitive_type));
+      },
+      primitive_type);
 }
 
-/* static */ Literal LiteralUtil::CreateR1(
-    const tensorflow::core::Bitmap& values) {
+/* static */ Literal LiteralUtil::CreateR1(const tsl::core::Bitmap& values) {
   Literal literal(
       ShapeUtil::MakeShape(PRED, {static_cast<int64_t>(values.bits())}));
   literal.PopulateR1(values);
@@ -335,7 +331,7 @@ Literal ConvertType(LiteralSlice literal) {
   Literal literal(
       ShapeUtil::MakeShape(U8, {static_cast<int64_t>(value.size())}));
   for (int i = 0, end = value.size(); i < end; ++i) {
-    literal.Set<uint8>({i}, value[i]);
+    literal.Set<uint8_t>({i}, value[i]);
   }
   return literal;
 }
@@ -372,51 +368,19 @@ Literal ConvertType(LiteralSlice literal) {
         IndexUtil::LinearIndexToMultidimensionalIndex(literal.shape(), i);
     std::vector<int64_t> to_multi_index =
         IndexUtil::LinearIndexToMultidimensionalIndex(shape_with_layout, i);
-    switch (literal.shape().element_type()) {
-      case PRED:
-        new_literal.Set<bool>(to_multi_index,
-                              literal.Get<bool>(from_multi_index));
-        break;
-      case U8:
-        new_literal.Set<uint8>(to_multi_index,
-                               literal.Get<uint8>(from_multi_index));
-        break;
-      case U32:
-        new_literal.Set<uint32>(to_multi_index,
-                                literal.Get<uint32>(from_multi_index));
-        break;
-      case S32:
-        new_literal.Set<int32>(to_multi_index,
-                               literal.Get<int32>(from_multi_index));
-        break;
-      case U64:
-        new_literal.Set<uint64_t>(to_multi_index,
-                                  literal.Get<uint64_t>(from_multi_index));
-        break;
-      case S64:
-        new_literal.Set<int64_t>(to_multi_index,
-                                 literal.Get<int64_t>(from_multi_index));
-        break;
-      case F32:
-        new_literal.Set<float>(to_multi_index,
-                               literal.Get<float>(from_multi_index));
-        break;
-      case F64:
-        new_literal.Set<double>(to_multi_index,
-                                literal.Get<double>(from_multi_index));
-        break;
-      case C64:
-        new_literal.Set<complex64>(to_multi_index,
-                                   literal.Get<complex64>(from_multi_index));
-        break;
-      case C128:
-        new_literal.Set<complex128>(to_multi_index,
-                                    literal.Get<complex128>(from_multi_index));
-        break;
-      default:
-        LOG(FATAL) << "Unhandled primitive element type: "
-                   << PrimitiveType_Name(literal.shape().element_type());
-    }
+    primitive_util::PrimitiveTypeSwitch<void>(
+        [&](auto primitive_type_constant) -> void {
+          if constexpr (primitive_util::IsArrayType(primitive_type_constant)) {
+            using NativeT = typename primitive_util::PrimitiveTypeToNative<
+                primitive_type_constant>::type;
+            new_literal.Set<NativeT>(to_multi_index,
+                                     literal.Get<NativeT>(from_multi_index));
+            return;
+          }
+          LOG(FATAL) << "Unhandled primitive element type: "
+                     << PrimitiveType_Name(literal.shape().element_type());
+        },
+        literal.shape().element_type());
   }
 
   return new_literal;
@@ -426,124 +390,47 @@ Literal ConvertType(LiteralSlice literal) {
     const LiteralSlice& literal) {
   CHECK(literal.shape().IsArray());
   CHECK_GT(ShapeUtil::ElementsIn(literal.shape()), 0);
-  switch (literal.shape().element_type()) {
-    case PRED:
-      return LiteralUtil::CreateR0<bool>(literal.GetFirstElement<bool>());
-    // 8 bit types.
-    case S8:
-      return LiteralUtil::CreateR0<int8>(literal.GetFirstElement<int8>());
-    case U8:
-      return LiteralUtil::CreateR0<uint8>(literal.GetFirstElement<uint8>());
-    // 16 bit types.
-    case BF16:
-      return LiteralUtil::CreateR0<bfloat16>(
-          literal.GetFirstElement<bfloat16>());
-    case F16:
-      return LiteralUtil::CreateR0<half>(literal.GetFirstElement<half>());
-    case S16:
-      return LiteralUtil::CreateR0<int16>(literal.GetFirstElement<int16>());
-    case U16:
-      return LiteralUtil::CreateR0<uint16>(literal.GetFirstElement<uint16>());
-    // 32 bit types.
-    case F32:
-      return LiteralUtil::CreateR0<float>(literal.GetFirstElement<float>());
-    case S32:
-      return LiteralUtil::CreateR0<int32>(literal.GetFirstElement<int32>());
-    case U32:
-      return LiteralUtil::CreateR0<uint32>(literal.GetFirstElement<uint32>());
-    // 64 bit types.
-    case C64:
-      return LiteralUtil::CreateR0<complex64>(
-          literal.GetFirstElement<complex64>());
-    case F64:
-      return LiteralUtil::CreateR0<double>(literal.GetFirstElement<double>());
-    case S64:
-      return LiteralUtil::CreateR0<int64_t>(literal.GetFirstElement<int64_t>());
-    case U64:
-      return LiteralUtil::CreateR0<uint64_t>(
-          literal.GetFirstElement<uint64_t>());
+  return CreateScalar<FirstElementProvider>(literal.shape().element_type(),
+                                            literal);
+}
 
-    case C128:
-      return LiteralUtil::CreateR0<complex128>(
-          literal.GetFirstElement<complex128>());
-    default:
-      LOG(FATAL) << "Unhandled primitive type "
-                 << literal.shape().element_type();
-  }
+/*static*/ Literal LiteralUtil::GetScalarLiteral(
+    const LiteralBase& literal, absl::Span<const int64_t> multi_index) {
+  return CreateScalar<GetElementAtIndexProvider>(literal.shape().element_type(),
+                                                 &literal, multi_index);
+}
+
+/*static*/ void LiteralUtil::SetScalarLiteral(
+    MutableLiteralBase& literal, absl::Span<const int64_t> multi_index,
+    const LiteralBase& scalar) {
+  primitive_util::PrimitiveTypeSwitch<void>(
+      [&](auto primitive_type_constant) -> void {
+        if constexpr (primitive_util::IsArrayType(primitive_type_constant)) {
+          SetScalarAtIndexImpl<primitive_type_constant>(literal, multi_index,
+                                                        scalar);
+          return;
+        }
+        LOG(FATAL) << "Unsupported element type: "
+                   << literal.shape().element_type();
+      },
+      literal.shape().element_type());
 }
 
 /* static */ Literal LiteralUtil::MaxElement(const LiteralSlice& literal) {
   CHECK(literal.shape().IsArray());
   CHECK_GT(ShapeUtil::ElementsIn(literal.shape()), 0);
-  switch (literal.shape().element_type()) {
-    case PRED: {
-      auto view = literal.data<bool>();
-      return LiteralUtil::CreateR0<bool>(*absl::c_max_element(view));
-    }
-    // 8 bit types.
-    case S8: {
-      auto view = literal.data<int8>();
-      return LiteralUtil::CreateR0<int8>(*absl::c_max_element(view));
-    }
-    case U8: {
-      auto view = literal.data<uint8>();
-      return LiteralUtil::CreateR0<uint8>(*absl::c_max_element(view));
-    }
-    // 16 bit types.
-    case BF16: {
-      auto view = literal.data<bfloat16>();
-      return LiteralUtil::CreateR0<bfloat16>(*absl::c_max_element(view));
-    }
-    case F16: {
-      auto view = literal.data<half>();
-      return LiteralUtil::CreateR0<half>(*absl::c_max_element(view));
-    }
-    case S16: {
-      auto view = literal.data<int16>();
-      return LiteralUtil::CreateR0<int16>(*absl::c_max_element(view));
-    }
-    case U16: {
-      auto view = literal.data<uint16>();
-      return LiteralUtil::CreateR0<uint16>(*absl::c_max_element(view));
-    }
-    // 32 bit types.
-    case F32: {
-      auto view = literal.data<float>();
-      return LiteralUtil::CreateR0<float>(*absl::c_max_element(view));
-    }
-    case S32: {
-      auto view = literal.data<int32>();
-      return LiteralUtil::CreateR0<int32>(*absl::c_max_element(view));
-    }
-    case U32: {
-      auto view = literal.data<uint32>();
-      return LiteralUtil::CreateR0<uint32>(*absl::c_max_element(view));
-    }
-    case F64: {
-      auto view = literal.data<double>();
-      return LiteralUtil::CreateR0<double>(*absl::c_max_element(view));
-    }
-    case S64: {
-      auto view = literal.data<int64_t>();
-      return LiteralUtil::CreateR0<int64_t>(*absl::c_max_element(view));
-    }
-    case U64: {
-      auto view = literal.data<uint64_t>();
-      return LiteralUtil::CreateR0<uint64_t>(*absl::c_max_element(view));
-    }
-    default:
-      LOG(FATAL) << "Unhandled primitive type "
-                 << literal.shape().element_type();
-  }
+  return CreateScalar<MaxElementProvider>(literal.shape().element_type(),
+                                          literal);
 }
 
 /* static */ Literal LiteralUtil::MakeTuple(
     absl::Span<const Literal* const> elements) {
-  std::vector<Shape> element_shapes;
+  std::vector<const Shape*> element_shapes;
+  element_shapes.reserve(elements.size());
   for (const auto* element : elements) {
-    element_shapes.push_back(element->shape());
+    element_shapes.push_back(&element->shape());
   }
-  Literal literal(ShapeUtil::MakeTupleShape(element_shapes));
+  Literal literal(ShapeUtil::MakeTupleShapeWithPtrs(element_shapes));
   for (int i = 0, end = elements.size(); i < end; ++i) {
     TF_CHECK_OK(literal.CopyFrom(*elements[i], /*dest_shape_index=*/{i}));
   }
@@ -552,11 +439,12 @@ Literal ConvertType(LiteralSlice literal) {
 
 /* static */ Literal LiteralUtil::MakeTupleFromSlices(
     absl::Span<const LiteralSlice> elements) {
-  std::vector<Shape> element_shapes;
+  std::vector<const Shape*> element_shapes;
+  element_shapes.reserve(elements.size());
   for (const auto& element : elements) {
-    element_shapes.push_back(element.shape());
+    element_shapes.push_back(&element.shape());
   }
-  Literal literal(ShapeUtil::MakeTupleShape(element_shapes));
+  Literal literal(ShapeUtil::MakeTupleShapeWithPtrs(element_shapes));
   for (int i = 0, end = elements.size(); i < end; ++i) {
     TF_CHECK_OK(literal.CopyFrom(elements[i], /*dest_shape_index=*/{i}));
   }
@@ -565,12 +453,12 @@ Literal ConvertType(LiteralSlice literal) {
 
 /* static */ Literal LiteralUtil::MakeTupleOwned(
     std::vector<Literal> elements) {
-  std::vector<Shape> element_shapes;
+  std::vector<const Shape*> element_shapes;
   element_shapes.reserve(elements.size());
   for (const auto& element : elements) {
-    element_shapes.push_back(element.shape());
+    element_shapes.push_back(&element.shape());
   }
-  Literal literal(ShapeUtil::MakeTupleShape(element_shapes));
+  Literal literal(ShapeUtil::MakeTupleShapeWithPtrs(element_shapes));
   for (int64_t i = 0, end = elements.size(); i < end; ++i) {
     TF_CHECK_OK(
         literal.MoveFrom(std::move(elements[i]), /*dest_shape_index=*/{i}));
@@ -578,7 +466,7 @@ Literal ConvertType(LiteralSlice literal) {
   return literal;
 }
 
-/* static */ string LiteralUtil::MultiIndexAsString(
+/* static */ std::string LiteralUtil::MultiIndexAsString(
     absl::Span<const int64_t> multi_index) {
   return StrCat("{", absl::StrJoin(multi_index, ","), "}");
 }

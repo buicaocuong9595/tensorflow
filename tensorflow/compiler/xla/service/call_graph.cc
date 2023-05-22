@@ -15,26 +15,25 @@ limitations under the License.
 
 #include "tensorflow/compiler/xla/service/call_graph.h"
 
+#include <memory>
 #include <queue>
 
 #include "absl/container/flat_hash_set.h"
-#include "absl/memory/memory.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "tensorflow/compiler/xla/map_util.h"
 #include "tensorflow/compiler/xla/status_macros.h"
 #include "tensorflow/compiler/xla/util.h"
-#include "tensorflow/core/lib/core/errors.h"
-#include "tensorflow/core/lib/core/status.h"
-#include "tensorflow/core/platform/types.h"
+#include "tensorflow/tsl/platform/errors.h"
+#include "tensorflow/tsl/platform/status.h"
 
 namespace xla {
 
 using absl::StrAppendFormat;
 using absl::StrCat;
 
-string CallContextToString(CallContext context) {
+std::string CallContextToString(CallContext context) {
   switch (context) {
     case CallContext::kNone:
       return "kNone";
@@ -57,6 +56,9 @@ CallContext GetInstructionCallContext(HloOpcode opcode) {
     case HloOpcode::kCall:
     case HloOpcode::kConditional:
     case HloOpcode::kWhile:
+    case HloOpcode::kAsyncStart:
+    case HloOpcode::kAsyncUpdate:
+    case HloOpcode::kAsyncDone:
       return CallContext::kControlFlow;
     case HloOpcode::kAllReduce:
     case HloOpcode::kReduceScatter:
@@ -67,6 +69,7 @@ CallContext GetInstructionCallContext(HloOpcode opcode) {
     case HloOpcode::kScatter:
     case HloOpcode::kSelectAndScatter:
     case HloOpcode::kSort:
+    case HloOpcode::kTopK:
     case HloOpcode::kFusion:
     case HloOpcode::kCustomCall:
       return CallContext::kEmbedded;
@@ -75,13 +78,13 @@ CallContext GetInstructionCallContext(HloOpcode opcode) {
   }
 }
 
-string CallSite::ToString() const {
+std::string CallSite::ToString() const {
   return StrCat(
       instruction()->name(), " calls in context ",
       CallContextToString(context()), ": ",
       absl::StrJoin(called_computations(), ", ",
-                    [](string* out, const HloComputation* computation) {
-                      out->append(computation->name());
+                    [](std::string* out, const HloComputation* computation) {
+                      absl::StrAppend(out, computation->name());
                     }));
 }
 
@@ -97,7 +100,9 @@ const CallSite* CallGraphNode::GetCallSite(
   return &callsites_[it->second];
 }
 
-std::string CallGraphNode::ToString() const { return computation_->name(); }
+absl::string_view CallGraphNode::ToString() const {
+  return computation_->name();
+}
 
 void CallGraphNode::AddCallerCallSite(const CallSite& caller_callsite) {
   caller_callsites_.push_back(caller_callsite);
@@ -279,7 +284,7 @@ void CallGraph::SetNodeDepths() {
 
 /* static */
 std::unique_ptr<CallGraph> CallGraph::Build(const HloModule* module) {
-  // Constructor for CallGraph is private so absl::make_unique can't be used.
+  // Constructor for CallGraph is private so std::make_unique can't be used.
   auto call_graph = absl::WrapUnique<CallGraph>(new CallGraph(module));
 
   VLOG(3) << "Building call graph for:";
@@ -320,12 +325,12 @@ std::unique_ptr<CallGraph> CallGraph::Build(const HloModule* module) {
 }
 
 Status CallGraph::VisitNodesInternal(
-    const VisitorFunction& visitor_func, const CallGraphNode& node,
+    VisitorFunction visitor_func, const CallGraphNode& node,
     absl::flat_hash_set<const CallGraphNode*>* visited) const {
   auto pair = visited->insert(&node);
   if (!pair.second) {
     // Node was not inserted. Node has already been visited.
-    return Status::OK();
+    return OkStatus();
   }
 
   for (const HloComputation* computation : node.callees()) {
@@ -336,7 +341,7 @@ Status CallGraph::VisitNodesInternal(
   return visitor_func(node);
 }
 
-Status CallGraph::VisitNodes(const VisitorFunction& visitor_func,
+Status CallGraph::VisitNodes(VisitorFunction visitor_func,
                              bool visit_unreachable_nodes) const {
   absl::flat_hash_set<const CallGraphNode*> visited;
   if (visit_unreachable_nodes) {
@@ -352,7 +357,7 @@ Status CallGraph::VisitNodes(const VisitorFunction& visitor_func,
         visitor_func, GetNode(module_->entry_computation()), &visited));
   }
 
-  return Status::OK();
+  return OkStatus();
 }
 
 bool CallGraph::IsFlattened() const {
@@ -361,6 +366,7 @@ bool CallGraph::IsFlattened() const {
       return false;
     }
     if (node.context() == CallContext::kControlFlow &&
+        !node.computation()->IsAsyncComputation() &&
         node.caller_callsites().size() > 1) {
       return false;
     }
@@ -369,7 +375,7 @@ bool CallGraph::IsFlattened() const {
 }
 
 std::vector<HloInstruction*> CallGraph::GetComputationCallers(
-    HloComputation* c) {
+    const HloComputation* c) const {
   std::vector<HloInstruction*> callers;
   for (const auto& callsite : GetNode(c).caller_callsites()) {
     callers.push_back(callsite.instruction());
@@ -388,6 +394,9 @@ CallGraph::NearestAncestorsInSameComputation(HloInstruction* a,
   auto next_caller = [this](HloInstruction* instruction) -> HloInstruction* {
     const CallGraphNode& node = GetNode(instruction->parent());
     if (node.caller_callsites().size() != 1) {
+      if (instruction->parent()->IsAsyncComputation()) {
+        return node.caller_callsites()[0].instruction();
+      }
       return nullptr;
     }
     return node.caller_callsites()[0].instruction();
@@ -430,8 +439,8 @@ CallGraph::NearestAncestorsInSameComputation(HloInstruction* a,
   return {nullptr, nullptr};
 }
 
-string CallGraph::ToString() const {
-  string out;
+std::string CallGraph::ToString() const {
+  std::string out;
   StrAppendFormat(&out, "Call graph for module %s:\n", module_->name());
   for (const CallGraphNode& node : nodes()) {
     StrAppendFormat(&out, "Computation %s:\n", node.computation()->name());

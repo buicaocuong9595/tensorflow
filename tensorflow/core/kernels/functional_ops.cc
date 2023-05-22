@@ -86,7 +86,7 @@ Status ToBool(gtl::ArraySlice<Tensor> t, bool* v) {
   } else {
     *v = t[0].NumElements() > 0;
   }
-  return Status::OK();
+  return OkStatus();
 }
 
 // Sets "rets" to be the output of "ctx". Validates rets' types based
@@ -105,7 +105,7 @@ Status SetOutputs(const OpKernel* kernel, OpKernelContext* ctx,
     }
     ctx->set_output(i, rets[i]);
   }
-  return Status::OK();
+  return OkStatus();
 }
 
 void SetRunOptions(OpKernelContext* ctx, FunctionLibraryRuntime::Options* opts,
@@ -160,7 +160,8 @@ class IfOp : public AsyncOpKernel {
           then_handle_(then_handle),
           else_handle_(else_handle),
           done_(std::move(done)),
-          lib_(CHECK_NOTNULL(ctx_->function_library())) {
+          lib_(CHECK_NOTNULL(ctx_->function_library())),
+          opts_(ctx->step_id()) {
       SetRunOptions(ctx_, &opts_, true /* always_collect_stats */);
       for (int i = 1; i < ctx_->num_inputs(); ++i) {
         args_.push_back(ctx_->input(i));
@@ -234,7 +235,7 @@ class IfOp : public AsyncOpKernel {
         handles_[lib] = {*then_handle, *else_handle};
       }
     }
-    return Status::OK();
+    return OkStatus();
   }
 };
 
@@ -286,7 +287,8 @@ class CaseOp : public AsyncOpKernel {
           branch_(branch),
           branch_handles_(branch_handles),
           done_(std::move(done)),
-          lib_(CHECK_NOTNULL(ctx_->function_library())) {
+          lib_(CHECK_NOTNULL(ctx_->function_library())),
+          opts_(ctx->step_id()) {
       SetRunOptions(ctx_, &opts_, true /* always_collect_stats */);
       for (int i = 1; i < ctx_->num_inputs(); ++i) {
         args_.push_back(ctx_->input(i));
@@ -333,23 +335,24 @@ class CaseOp : public AsyncOpKernel {
 
 // TODO(drpng): remove this.
 REGISTER_KERNEL_BUILDER(Name("_If").Device(DEVICE_CPU), IfOp);
-REGISTER_KERNEL_BUILDER(Name("_If").Device(DEVICE_GPU).HostMemory("cond"),
+REGISTER_KERNEL_BUILDER(Name("_If").Device(DEVICE_DEFAULT).HostMemory("cond"),
                         IfOp);
 
 REGISTER_KERNEL_BUILDER(Name("If").Device(DEVICE_CPU), IfOp);
-REGISTER_KERNEL_BUILDER(Name("If").Device(DEVICE_GPU).HostMemory("cond"), IfOp);
+REGISTER_KERNEL_BUILDER(Name("If").Device(DEVICE_DEFAULT).HostMemory("cond"),
+                        IfOp);
 
 REGISTER_KERNEL_BUILDER(Name("Case").Device(DEVICE_CPU), CaseOp);
 REGISTER_KERNEL_BUILDER(
-    Name("Case").Device(DEVICE_GPU).HostMemory("branch_index"), CaseOp);
+    Name("Case").Device(DEVICE_DEFAULT).HostMemory("branch_index"), CaseOp);
 REGISTER_KERNEL_BUILDER(Name("StatelessCase").Device(DEVICE_CPU), CaseOp);
 REGISTER_KERNEL_BUILDER(
-    Name("StatelessCase").Device(DEVICE_GPU).HostMemory("branch_index"),
+    Name("StatelessCase").Device(DEVICE_DEFAULT).HostMemory("branch_index"),
     CaseOp);
 
 REGISTER_KERNEL_BUILDER(Name("StatelessIf").Device(DEVICE_CPU), IfOp);
 REGISTER_KERNEL_BUILDER(
-    Name("StatelessIf").Device(DEVICE_GPU).HostMemory("cond"), IfOp);
+    Name("StatelessIf").Device(DEVICE_DEFAULT).HostMemory("cond"), IfOp);
 
 class WhileOp : public AsyncOpKernel {
  public:
@@ -401,11 +404,11 @@ class WhileOp : public AsyncOpKernel {
                                  const Tensor& cond_t, bool* out_result) {
     bool is_pluggable = ctx->op_device_context() &&
                         ctx->op_device_context()->IsPluggableDevice();
-    const DeviceBase::GpuDeviceInfo* gpu_device_info =
-        ctx->device()->tensorflow_gpu_device_info();
+    const DeviceBase::AcceleratorDeviceInfo* accelerator_device_info =
+        ctx->device()->tensorflow_accelerator_device_info();
     const bool is_hostmem_dtype =
         cond_t.dtype() == DT_INT32 || cond_t.dtype() == DT_INT64;
-    if (!is_hostmem_dtype && (is_pluggable || gpu_device_info) &&
+    if (!is_hostmem_dtype && (is_pluggable || accelerator_device_info) &&
         (opts.rets_alloc_attrs.empty() ||
          !opts.rets_alloc_attrs[0].on_host())) {
       // Copy the ret value to host if it's allocated on device.
@@ -456,7 +459,7 @@ class WhileOp : public AsyncOpKernel {
     Status GetArg(int index, const Tensor** val) override {
       if (index < args_->size()) {
         *val = &(*args_)[index];
-        return Status::OK();
+        return OkStatus();
       } else {
         return errors::InvalidArgument("Argument ", index, " is out of range.");
       }
@@ -486,7 +489,7 @@ class WhileOp : public AsyncOpKernel {
                                        DataTypeString(val.dtype()), ".");
       }
       (*retvals_)[index] = val;
-      return Status::OK();
+      return OkStatus();
     }
 
    private:
@@ -506,11 +509,12 @@ class WhileOp : public AsyncOpKernel {
           cond_handle_(cond_handle),
           body_handle_(body_handle),
           done_(std::move(done)),
-          lib_(CHECK_NOTNULL(ctx_->function_library())) {
+          lib_(CHECK_NOTNULL(ctx_->function_library())),
+          opts_(ctx->step_id()) {
       SetRunOptions(ctx_, &opts_, false /* always_collect_stats */);
       GetArgsFromContext(ctx, &args_, &loop_var_types_);
       body_frame_ =
-          absl::make_unique<BodyFuncCallFrame>(&args_, &rets_, loop_var_types_);
+          std::make_unique<BodyFuncCallFrame>(&args_, &rets_, loop_var_types_);
     }
 
     ~State() {}
@@ -563,7 +567,7 @@ class WhileOp : public AsyncOpKernel {
       }
 
       if (!cond) {
-        return Finish(Status::OK());
+        return Finish(OkStatus());
       }
       rets_.clear();
       rets_.resize(args_.size());
@@ -686,18 +690,18 @@ class WhileOp : public AsyncOpKernel {
         handles_[lib] = {*cond_handle, *body_handle};
       }
     }
-    return Status::OK();
+    return OkStatus();
   }
 };
 // TODO(drpng): remove these.
 REGISTER_KERNEL_BUILDER(Name("_While").Device(DEVICE_CPU), WhileOp);
-REGISTER_KERNEL_BUILDER(Name("_While").Device(DEVICE_GPU), WhileOp);
+REGISTER_KERNEL_BUILDER(Name("_While").Device(DEVICE_DEFAULT), WhileOp);
 
 REGISTER_KERNEL_BUILDER(Name("While").Device(DEVICE_CPU), WhileOp);
-REGISTER_KERNEL_BUILDER(Name("While").Device(DEVICE_GPU), WhileOp);
+REGISTER_KERNEL_BUILDER(Name("While").Device(DEVICE_DEFAULT), WhileOp);
 
 REGISTER_KERNEL_BUILDER(Name("StatelessWhile").Device(DEVICE_CPU), WhileOp);
-REGISTER_KERNEL_BUILDER(Name("StatelessWhile").Device(DEVICE_GPU), WhileOp);
+REGISTER_KERNEL_BUILDER(Name("StatelessWhile").Device(DEVICE_DEFAULT), WhileOp);
 
 class ToBoolOp : public OpKernel {
  public:
@@ -721,7 +725,7 @@ Status GetScalar(OpKernelContext* ctx, int index, int32* value,
                                    t.shape().DebugString());
   }
   *value = t.scalar<int32>()();
-  return Status::OK();
+  return OkStatus();
 }
 
 class ForOp : public AsyncOpKernel {
@@ -750,6 +754,7 @@ class ForOp : public AsyncOpKernel {
           ctx_(ctx),
           done_(std::move(done)),
           lib_(CHECK_NOTNULL(ctx_->function_library())),
+          opts_(ctx->step_id()),
           args_(1 + ctx_->num_inputs() - 3) {
       args_[0] = Tensor(DT_INT32, {});
       iter_ = &args_[0].scalar<int32>()();
@@ -794,7 +799,7 @@ class ForOp : public AsyncOpKernel {
           (delta_ < 0 && *iter_ >= limit_) ||
           (delta_ == 0 && *iter_ == limit_)) {
         RunNext();
-        return Status::OK();
+        return OkStatus();
       } else {
         return errors::InvalidArgument("Invalid start/limit/delta: ", *iter_,
                                        " ", limit_, " ", delta_);
@@ -809,7 +814,7 @@ class ForOp : public AsyncOpKernel {
         done_loop = *iter_ <= limit_;
       }
       if (done_loop) {
-        Finish(Status::OK());
+        Finish(OkStatus());
         return;
       }
 
@@ -848,7 +853,7 @@ class ForOp : public AsyncOpKernel {
 
 REGISTER_KERNEL_BUILDER(Name("For").Device(DEVICE_CPU), ForOp);
 REGISTER_KERNEL_BUILDER(Name("For")
-                            .Device(DEVICE_GPU)
+                            .Device(DEVICE_DEFAULT)
                             .HostMemory("start")
                             .HostMemory("limit")
                             .HostMemory("delta"),
@@ -890,7 +895,7 @@ class FakeParamOp : public OpKernel {
 };
 
 REGISTER_KERNEL_BUILDER(Name("FakeParam").Device(DEVICE_CPU), FakeParamOp);
-REGISTER_KERNEL_BUILDER(Name("FakeParam").Device(DEVICE_GPU), FakeParamOp);
+REGISTER_KERNEL_BUILDER(Name("FakeParam").Device(DEVICE_DEFAULT), FakeParamOp);
 
 // DeviceIndexOP returns the current device index.
 class DeviceIndexOp : public OpKernel {
@@ -921,7 +926,8 @@ class DeviceIndexOp : public OpKernel {
 
 REGISTER_KERNEL_BUILDER(Name("DeviceIndex").Device(DEVICE_CPU), DeviceIndexOp);
 REGISTER_KERNEL_BUILDER(
-    Name("DeviceIndex").Device(DEVICE_GPU).HostMemory("index"), DeviceIndexOp);
+    Name("DeviceIndex").Device(DEVICE_DEFAULT).HostMemory("index"),
+    DeviceIndexOp);
 
 }  // namespace
 }  // namespace tensorflow

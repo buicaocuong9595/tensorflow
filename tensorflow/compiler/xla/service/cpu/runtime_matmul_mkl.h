@@ -17,29 +17,29 @@ limitations under the License.
 #define TENSORFLOW_COMPILER_XLA_SERVICE_CPU_RUNTIME_MATMUL_MKL_H_
 
 #include <iostream>
-#include "tensorflow/core/platform/types.h"
+
 #ifdef ENABLE_MKL
 #include "third_party/intel_mkl_ml/include/mkl_cblas.h"
 
 extern void __xla_cpu_runtime_MKLMatMulF32(
     const void* /* xla::ExecutableRunOptions* */ run_options_ptr, float* out,
     float* lhs, float* rhs, int64_t m, int64_t n, int64_t k,
-    tensorflow::int32 transpose_lhs, tensorflow::int32 transpose_rhs);
+    int32_t transpose_lhs, int32_t transpose_rhs);
 extern void __xla_cpu_runtime_MKLMatMulF64(
     const void* /* xla::ExecutableRunOptions* */ run_options_ptr, double* out,
     double* lhs, double* rhs, int64_t m, int64_t n, int64_t k,
-    tensorflow::int32 transpose_lhs, tensorflow::int32 transpose_rhs);
+    int32_t transpose_lhs, int32_t transpose_rhs);
 extern void __xla_cpu_runtime_MKLSingleThreadedMatMulF32(
     const void* /* xla::ExecutableRunOptions* */ run_options_ptr, float* out,
     float* lhs, float* rhs, int64_t m, int64_t n, int64_t k,
-    tensorflow::int32 transpose_lhs, tensorflow::int32 transpose_rhs);
+    int32_t transpose_lhs, int32_t transpose_rhs);
 extern void __xla_cpu_runtime_MKLSingleThreadedMatMulF64(
     const void* /* xla::ExecutableRunOptions* */ run_options_ptr, double* out,
     double* lhs, double* rhs, int64_t m, int64_t n, int64_t k,
-    tensorflow::int32 transpose_lhs, tensorflow::int32 transpose_rhs);
+    int32_t transpose_lhs, int32_t transpose_rhs);
 
 #else
-extern void __xla_cpu_runtime_MKLMatMulF32(
+inline extern void __xla_cpu_runtime_MKLMatMulF32(
     const void* /* xla::ExecutableRunOptions* */ run_options_ptr, float* out,
     float* lhs, float* rhs, int64_t m, int64_t n, int64_t k,
     int32_t transpose_lhs, int32_t transpose_rhs) {
@@ -47,7 +47,7 @@ extern void __xla_cpu_runtime_MKLMatMulF32(
                "ENABLE_MKL. Add --config=mkl to build with MKL.";
   exit(1);
 }
-extern void __xla_cpu_runtime_MKLMatMulF64(
+inline extern void __xla_cpu_runtime_MKLMatMulF64(
     const void* /* xla::ExecutableRunOptions* */ run_options_ptr, double* out,
     double* lhs, double* rhs, int64_t m, int64_t n, int64_t k,
     int32_t transpose_lhs, int32_t transpose_rhs) {
@@ -55,7 +55,7 @@ extern void __xla_cpu_runtime_MKLMatMulF64(
                "ENABLE_MKL. Add --config=mkl to build with MKL.";
   exit(1);
 }
-extern void __xla_cpu_runtime_MKLSingleThreadedMatMulF32(
+inline extern void __xla_cpu_runtime_MKLSingleThreadedMatMulF32(
     const void* /* xla::ExecutableRunOptions* */ run_options_ptr, float* out,
     float* lhs, float* rhs, int64_t m, int64_t n, int64_t k,
     int32_t transpose_lhs, int32_t transpose_rhs) {
@@ -63,7 +63,7 @@ extern void __xla_cpu_runtime_MKLSingleThreadedMatMulF32(
                "ENABLE_MKL. Add --config=mkl to build with MKL.";
   exit(1);
 }
-extern void __xla_cpu_runtime_MKLSingleThreadedMatMulF64(
+inline extern void __xla_cpu_runtime_MKLSingleThreadedMatMulF64(
     const void* /* xla::ExecutableRunOptions* */ run_options_ptr, double* out,
     double* lhs, double* rhs, int64_t m, int64_t n, int64_t k,
     int32_t transpose_lhs, int32_t transpose_rhs) {

@@ -19,6 +19,7 @@ limitations under the License.
 #include <cstdint>
 #include <set>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include "absl/types/variant.h"
@@ -38,12 +39,15 @@ enum class OperationType {
   BATCH_TO_SPACE,
   BATCH_NORMALIZATION,
   BATCHED_MATMUL,
+  CAST,
+  CEIL,
   CONCAT,
   CONSTANT,
   CONVOLUTION_2D,
   CONVOLUTION_TRANSPOSED,
   COPY,
   COS,
+  CUMSUM,
   DENSIFY,
   DEPTHWISE_CONVOLUTION,
   DEPTH_TO_SPACE,
@@ -57,12 +61,14 @@ enum class OperationType {
   FULLY_CONNECTED,
   FULLY_CONNECTED_INT8,
   GATHER,
+  GELU,
   GREATER,
   GREATER_EQUAL,
   HARD_SWISH,
   LESS,
   LESS_EQUAL,
   LOG,
+  LOGICAL_AND,
   LSTM,
   MAXIMUM,
   MAX_UNPOOLING_2D,
@@ -72,7 +78,9 @@ enum class OperationType {
   MUL,
   NEG,
   NOT_EQUAL,
+  ONE_HOT,
   PAD,
+  PAD_V2,
   POOLING_2D,
   POW,
   PRELU,
@@ -87,7 +95,10 @@ enum class OperationType {
   RESHAPE,
   RESIZE,
   RSQRT,
+  SELECT,
+  SELECT_V2,
   SIGMOID,
+  SIGN,
   SIN,
   SLICE,
   SOFTMAX,
@@ -107,15 +118,15 @@ std::string ToString(enum OperationType op);
 
 OperationType OperationTypeFromString(const std::string& name);
 
-typedef absl::variant<absl::monostate, Tensor<HWC, DataType::FLOAT32>,
-                      Tensor<Linear, DataType::FLOAT32>, float>
-    TensorOrScalar;
+template <DataType DataTypeT, typename t>
+using TensorOrScalarBase = std::variant<std::monostate, Tensor<HWC, DataTypeT>,
+                                        Tensor<Linear, DataTypeT>, t>;
+
+using TensorOrScalar = TensorOrScalarBase<DataType::FLOAT32, float>;
 
 struct Padding2D {
-  Padding2D() = default;
-  Padding2D& operator=(const Padding2D& value);
-  bool operator==(const Padding2D& value);
-  bool operator!=(const Padding2D& value);
+  bool operator==(const Padding2D& value) const;
+  bool operator!=(const Padding2D& value) const;
   Padding2D& operator-(const Padding2D& value);
 
   // Padding values for every axis (if needed), where 'prepended' defines
@@ -126,8 +137,6 @@ struct Padding2D {
 };
 
 struct Padding3D {
-  Padding3D() = default;
-  Padding3D& operator=(const Padding3D& value);
   bool operator==(const Padding3D& value);
   bool operator!=(const Padding3D& value);
   Padding3D& operator-(const Padding3D& value);
@@ -266,6 +275,19 @@ struct Convolution2DAttributes {
 
   Tensor<OHWI, DataType::FLOAT32> weights;
   Tensor<Linear, DataType::FLOAT32> bias;  // optional
+
+  int groups = 1;  // optional, split channels dimension on equal groups
+  // Restrictions:
+  // src.Channels() and dst.Channels() must be divisible by groups
+  // Restrictions for gpu delegates:
+  //   src_group_channels = src.Channels() / groups;
+  //   dst_group_channels = dst.Channels() / groups;
+  //   src_group_channels and dst_group_channels must be divisible by 4
+  // if groups != 1, weights will have special format
+  //   weights.o = group_weights.o * groups;
+  //   weights.i = group_weights.i;
+  //   weights.h = group_weights.h;
+  //   weights.w = group_weights.w;
 };
 
 struct Convolution3DAttributes {
@@ -275,6 +297,20 @@ struct Convolution3DAttributes {
 
   Tensor<OHWDI, DataType::FLOAT32> weights;
   Tensor<Linear, DataType::FLOAT32> bias;  // optional
+
+  int groups = 1;  // optional, split channels dimension on equal groups
+  // Restrictions:
+  // src.Channels() and dst.Channels() must be divisible by groups
+  // Restrictions for gpu delegates:
+  //   src_group_channels = src.Channels() / groups;
+  //   dst_group_channels = dst.Channels() / groups;
+  //   src_group_channels and dst_group_channels must be divisible by 4
+  // if groups != 1, weights will have special format
+  //   weights.o = group_weights.o * groups;
+  //   weights.i = group_weights.i;
+  //   weights.h = group_weights.h;
+  //   weights.w = group_weights.w;
+  //   weights.d = group_weights.d;
 };
 
 // @return shape of a tensor after Convolution2D operation is applied to
@@ -371,9 +407,6 @@ struct ReLUAttributes {
 };
 
 struct PReLUAttributes {
-  // clip <= 0 mean it is not set.
-  float clip = 0;
-
   // If alpha is linear, then it is sharded across CHANNELS axis, otherwise
   // full shape alpha is required.
   absl::variant<Tensor<Linear, DataType::FLOAT32>,
@@ -454,6 +487,7 @@ struct PadAttributes {
 
   BHWC prepended;
   BHWC appended;
+  float constant_values = 0;
 };
 
 // @return shape of a tensor after Pad operation is applied to the given input.
@@ -470,9 +504,12 @@ struct Pad3DAttributes {
 // input.
 BHWDC CalculateOutputShape(const BHWDC& input, const Pad3DAttributes& attr);
 
-struct ConstTensorAttributes {
-  Tensor<BHWC, DataType::FLOAT32> tensor;
+template <DataType DataTypeT>
+struct ConstTensorAttributesBase {
+  Tensor<BHWC, DataTypeT> tensor;
 };
+
+using ConstTensorAttributes = ConstTensorAttributesBase<DataType::FLOAT32>;
 
 struct DensifyAttributes {
   Tensor<BHWC, DataType::FLOAT32> tensor;
@@ -532,13 +569,17 @@ BHWC CalculateOutputShape(const BHWC& input, const MeanAttributes& attr);
 // @return shape of a tensor after Mean operation is applied to the given input.
 BHWDC CalculateOutputShape(const BHWDC& input, const MeanAttributes& attr);
 
-struct ElementwiseAttributes {
-  TensorOrScalar param;
+template <DataType DataTypeT, typename t>
+struct ElementwiseAttributesBase {
+  TensorOrScalarBase<DataTypeT, t> param;
   // For elementwise operation with 2 inputs op(A, B), runtime_tensor_is_second
   // true when runtime tensor is B(on second position). this is important for
-  // ops that non commutative, for example substract.
+  // ops that non commutative, for example subtract.
   bool runtime_tensor_is_second = false;
 };
+
+using ElementwiseAttributes =
+    ElementwiseAttributesBase<DataType::FLOAT32, float>;
 
 struct ReshapeAttributes {
   BHWC new_shape;
@@ -585,6 +626,22 @@ struct QuantizeAndDequantizeAttributes {
 };
 
 struct GatherAttributes {
+  Axis axis = Axis::UNKNOWN;
+  Tensor<Linear, DataType::INT32> indices;
+};
+
+struct OneHotAttributes {
+  float on_value = 1;
+  float off_value = 0;
+};
+
+struct SelectV2Attributes {
+  bool broadcast_true = false;
+  bool broadcast_false = false;
+  bool scalar_cond = false;
+};
+
+struct CumsumAttributes {
   Axis axis = Axis::UNKNOWN;
 };
 

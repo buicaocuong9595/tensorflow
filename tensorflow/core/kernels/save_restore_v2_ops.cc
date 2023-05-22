@@ -20,9 +20,11 @@ limitations under the License.
 
 #include "tensorflow/core/framework/bounds_check.h"
 #include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/framework/resource_mgr.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/framework/types.pb.h"
+#include "tensorflow/core/kernels/checkpoint_callback_manager.h"
 #include "tensorflow/core/kernels/save_restore_tensor.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/lib/io/path.h"
@@ -157,6 +159,25 @@ class SaveV2 : public OpKernel {
     }
     OP_REQUIRES_OK(context, writer.Finish());
     VLOG(1) << "Done BundleWriter, prefix_string: " << prefix_string;
+
+    ResourceMgr* resource_manager = context->resource_manager();
+    if (resource_manager != nullptr) {
+      checkpoint::CheckpointCallbackManager* checkpoint_callback_manager;
+      OP_REQUIRES_OK(
+          context,
+          resource_manager
+              ->LookupOrCreate<checkpoint::CheckpointCallbackManager>(
+                  resource_manager->default_container(),
+                  std::string(
+                      checkpoint::kCheckpointCallbackManagerResourceName),
+                  &checkpoint_callback_manager,
+                  [](checkpoint::CheckpointCallbackManager** out) {
+                    *out = new checkpoint::CheckpointCallbackManager();
+                    return OkStatus();
+                  }));
+      checkpoint_callback_manager->Save(prefix_string);
+      checkpoint_callback_manager->Unref();
+    }
   }
 };
 REGISTER_KERNEL_BUILDER(Name("SaveV2").Device(DEVICE_CPU), SaveV2);
@@ -182,6 +203,7 @@ class RestoreV2 : public OpKernel {
 
     const string& prefix_string = prefix.scalar<tstring>()();
 
+    VLOG(2) << "Started Restore at prefix: " << prefix_string;
     // Intention: we plan to use the RestoreV2 op as a backward-compatible
     // reader as we upgrade to the V2 format.  This allows transparent upgrade.
     // We here attempt to read a V1 checkpoint, if "prefix_string" does not
@@ -190,6 +212,7 @@ class RestoreV2 : public OpKernel {
     std::vector<string> paths;
     if (!env->GetMatchingPaths(MetaFilename(prefix_string), &paths).ok() ||
         paths.empty()) {
+      VLOG(2) << "Fallback to V1 Restore at prefix: " << prefix_string;
       // Cannot find V2's metadata file, so "prefix_string" does not point to a
       // V2 checkpoint.  Invokes the V1 read path instead.
       for (size_t i = 0; i < tensor_names.NumElements(); ++i) {
@@ -205,6 +228,26 @@ class RestoreV2 : public OpKernel {
     // If found, invokes the V2 reader.
     OP_REQUIRES_OK(context, RestoreTensorsV2(context, prefix, tensor_names,
                                              shape_and_slices, dtypes_));
+
+    ResourceMgr* resource_manager = context->resource_manager();
+    if (resource_manager != nullptr) {
+      checkpoint::CheckpointCallbackManager* checkpoint_callback_manager;
+      OP_REQUIRES_OK(
+          context,
+          resource_manager
+              ->LookupOrCreate<checkpoint::CheckpointCallbackManager>(
+                  resource_manager->default_container(),
+                  std::string(
+                      checkpoint::kCheckpointCallbackManagerResourceName),
+                  &checkpoint_callback_manager,
+                  [](checkpoint::CheckpointCallbackManager** out) {
+                    *out = new checkpoint::CheckpointCallbackManager();
+                    return OkStatus();
+                  }));
+      checkpoint_callback_manager->Restore(prefix_string);
+      checkpoint_callback_manager->Unref();
+    }
+    VLOG(2) << "Finished Restore at prefix: " << prefix_string;
   }
 
  private:
@@ -220,6 +263,8 @@ class MergeV2Checkpoints : public OpKernel {
       : OpKernel(context) {
     OP_REQUIRES_OK(context,
                    context->GetAttr("delete_old_dirs", &delete_old_dirs_));
+    OP_REQUIRES_OK(context, context->GetAttr("allow_missing_files",
+                                             &allow_missing_files_));
   }
 
   void Compute(OpKernelContext* context) override {
@@ -239,8 +284,9 @@ class MergeV2Checkpoints : public OpKernel {
         gtl::ArraySlice<tstring>(checkpoint_prefixes.flat<tstring>());
     Env* env = Env::Default();
     const string& merged_prefix = destination_prefix.scalar<tstring>()();
-    OP_REQUIRES_OK(
-        context, tensorflow::MergeBundles(env, input_prefixes, merged_prefix));
+    OP_REQUIRES_OK(context,
+                   tensorflow::MergeBundles(env, input_prefixes, merged_prefix,
+                                            allow_missing_files_));
 
     if (delete_old_dirs_) {
       const string merged_dir(io::Dirname(merged_prefix));
@@ -258,6 +304,10 @@ class MergeV2Checkpoints : public OpKernel {
  private:
   // On merge, whether or not to delete the input (temporary) directories.
   bool delete_old_dirs_;
+
+  // On merge, whether or not to relax condition that all input prefix filenames
+  // to exist.
+  bool allow_missing_files_;
 };
 REGISTER_KERNEL_BUILDER(Name("MergeV2Checkpoints").Device(DEVICE_CPU),
                         MergeV2Checkpoints);

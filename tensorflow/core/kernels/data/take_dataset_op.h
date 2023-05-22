@@ -38,9 +38,12 @@ class TakeDataset : public DatasetBase {
 
   string DebugString() const override;
 
-  int64_t Cardinality() const override;
+  int64_t CardinalityInternal(CardinalityOptions options) const override;
 
   Status InputDatasets(std::vector<const DatasetBase*>* inputs) const override;
+
+  Status Get(OpKernelContext* ctx, int64 index,
+             std::vector<Tensor>* out_tensors) const override;
 
   Status CheckExternalState() const override;
 

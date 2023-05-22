@@ -20,16 +20,16 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/types/span.h"
+#include "mlir/IR/Value.h"  // from @llvm-project
+#include "tensorflow/compiler/xla/hlo/ir/hlo_instruction.h"
 #include "tensorflow/compiler/xla/service/buffer_assignment.h"
 #include "tensorflow/compiler/xla/service/gpu/buffer_allocations.h"
 #include "tensorflow/compiler/xla/service/gpu/launch_dimensions.h"
 #include "tensorflow/compiler/xla/service/gpu/thunk.h"
-#include "tensorflow/compiler/xla/service/hlo_instruction.h"
+#include "tensorflow/compiler/xla/stream_executor/stream_executor.h"
 #include "tensorflow/compiler/xla/types.h"
-#include "tensorflow/core/platform/mutex.h"
-#include "tensorflow/core/platform/stream_executor_no_cuda.h"
-#include "tensorflow/core/platform/thread_annotations.h"
 
 namespace xla {
 namespace gpu {
@@ -45,11 +45,14 @@ class KernelThunk : public Thunk {
  public:
   // Constructs a thunk for the given kernel.
   //
-  // `hlo_instruction` is as in Thunk. Other arguments are as the class members.
-  KernelThunk(ThunkInfo thunk_info,
-              absl::Span<const BufferAllocation* const> args,
-              const string& kernel_name,
-              const LaunchDimensions& launch_dimensions);
+  // KernelThunk takes args as BufferAllocation::Slice's. Each slice directly
+  // corresponds to an argument or output of the computation. Also, the values
+  // must correspond to each arg directly, not to their base allocation (e.g.
+  // they can be the result of an mlir::memref::ViewOp).
+  KernelThunk(ThunkInfo thunk_info, std::vector<BufferAllocation::Slice> args,
+              const std::string& kernel_name,
+              const LaunchDimensions& launch_dimensions,
+              std::vector<mlir::Value> values);
   KernelThunk(const KernelThunk&) = delete;
   KernelThunk& operator=(const KernelThunk&) = delete;
   ~KernelThunk() override = default;
@@ -60,30 +63,41 @@ class KernelThunk : public Thunk {
                     se::StreamExecutor* executor) override;
   Status ExecuteOnStream(const ExecuteParams& params) override;
 
-  const std::vector<const BufferAllocation*>& arguments() const {
+  void ClearCompileTimeInfo() override {
+    Thunk::ClearCompileTimeInfo();
+    for (auto& value : values_) {
+      value = nullptr;
+    }
+  }
+
+  const std::vector<BufferAllocation::Slice>& arguments() const {
     return args_;
   }
-  const string& kernel_name() const { return kernel_name_; }
+  const std::string& kernel_name() const { return kernel_name_; }
   const LaunchDimensions& launch_dimensions() const {
     return launch_dimensions_;
   }
+  absl::Span<const mlir::Value> values() const { return values_; }
 
  private:
-  // Buffers passed to the kernel as arguments.
-  const std::vector<const BufferAllocation*> args_;
+  // Buffer slices passed to the kernel as arguments.
+  const std::vector<BufferAllocation::Slice> args_;
 
   // Entry kernel name for the computation.
-  const string kernel_name_;
+  const std::string kernel_name_;
 
   // The thread and block dimension used to launch the kernel.
   const LaunchDimensions launch_dimensions_;
 
-  mutable tensorflow::mutex mutex_;
+  // mlir::Value(s) corresponding to the buffer slice arguments.
+  std::vector<mlir::Value> values_;
+
+  mutable absl::Mutex mutex_;
 
   // Loaded kernels for each `StreamExecutor`.  Requires pointer stability of
   // values.
-  std::unordered_map<se::StreamExecutor*, std::unique_ptr<se::KernelBase>>
-      kernel_cache_ TF_GUARDED_BY(mutex_);
+  absl::flat_hash_map<se::StreamExecutor*, std::unique_ptr<se::KernelBase>>
+      kernel_cache_ ABSL_GUARDED_BY(mutex_);
 };
 
 }  // namespace gpu

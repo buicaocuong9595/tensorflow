@@ -43,28 +43,30 @@ type DataType C.TF_DataType
 
 // Types of scalar values in the TensorFlow type system.
 const (
-	Float      DataType = C.TF_FLOAT
-	Double     DataType = C.TF_DOUBLE
-	Int32      DataType = C.TF_INT32
-	Uint32     DataType = C.TF_UINT32
-	Uint8      DataType = C.TF_UINT8
-	Int16      DataType = C.TF_INT16
-	Int8       DataType = C.TF_INT8
-	String     DataType = C.TF_STRING
-	Complex64  DataType = C.TF_COMPLEX64
-	Complex    DataType = C.TF_COMPLEX
-	Int64      DataType = C.TF_INT64
-	Uint64     DataType = C.TF_UINT64
-	Bool       DataType = C.TF_BOOL
-	Qint8      DataType = C.TF_QINT8
-	Quint8     DataType = C.TF_QUINT8
-	Qint32     DataType = C.TF_QINT32
-	Bfloat16   DataType = C.TF_BFLOAT16
-	Qint16     DataType = C.TF_QINT16
-	Quint16    DataType = C.TF_QUINT16
-	Uint16     DataType = C.TF_UINT16
-	Complex128 DataType = C.TF_COMPLEX128
-	Half       DataType = C.TF_HALF
+	Float        DataType = C.TF_FLOAT
+	Double       DataType = C.TF_DOUBLE
+	Int32        DataType = C.TF_INT32
+	Uint32       DataType = C.TF_UINT32
+	Uint8        DataType = C.TF_UINT8
+	Int16        DataType = C.TF_INT16
+	Int8         DataType = C.TF_INT8
+	String       DataType = C.TF_STRING
+	Complex64    DataType = C.TF_COMPLEX64
+	Complex      DataType = C.TF_COMPLEX
+	Int64        DataType = C.TF_INT64
+	Uint64       DataType = C.TF_UINT64
+	Bool         DataType = C.TF_BOOL
+	Qint8        DataType = C.TF_QINT8
+	Quint8       DataType = C.TF_QUINT8
+	Qint32       DataType = C.TF_QINT32
+	Bfloat16     DataType = C.TF_BFLOAT16
+	Qint16       DataType = C.TF_QINT16
+	Quint16      DataType = C.TF_QUINT16
+	Uint16       DataType = C.TF_UINT16
+	Complex128   DataType = C.TF_COMPLEX128
+	Half         DataType = C.TF_HALF
+	Float8e5m2   DataType = C.TF_FLOAT8_E5M2
+	Float8e4m3fn DataType = C.TF_FLOAT8_E4M3FN
 )
 
 // Tensor holds a multi-dimensional array of elements of a single data type.
@@ -76,7 +78,7 @@ type Tensor struct {
 // NewTensor converts from a Go value to a Tensor. Valid values are scalars,
 // slices, and arrays. Every element of a slice must have the same length so
 // that the resulting Tensor has a valid shape.
-func NewTensor(value interface{}) (*Tensor, error) {
+func NewTensor(value any) (*Tensor, error) {
 	val := reflect.ValueOf(value)
 	shape, dataType, err := shapeAndDataTypeOf(val)
 	if err != nil {
@@ -98,9 +100,7 @@ func NewTensor(value interface{}) (*Tensor, error) {
 
 	raw := tensorData(t.c)
 
-	defer runtime.SetFinalizer(t, func(t *Tensor) {
-		t.finalize()
-	})
+	runtime.SetFinalizer(t, (*Tensor).finalize)
 
 	buf := bytes.NewBuffer(raw[:0:len(raw)])
 
@@ -115,10 +115,7 @@ func NewTensor(value interface{}) (*Tensor, error) {
 		// not be contiguous with the others or in the order we might
 		// expect, so we need to work our way down to each slice of
 		// primitives and copy them individually
-		if n, err := encodeTensorWithSlices(buf, val, shape); err != nil {
-			// Set nbytes to count of bytes written for deferred call to
-			// runtime.SetFinalizer
-			nbytes = uintptr(n)
+		if _, err := encodeTensorWithSlices(buf, val, shape); err != nil {
 			return nil, err
 		}
 	}
@@ -164,7 +161,7 @@ type eface struct {
 // reference to the original value. But we just want a pointer to make it
 // efficient to read the value, so cheating like this should be safe and
 // reasonable.
-func unpackEFace(obj interface{}) *eface {
+func unpackEFace(obj any) *eface {
 	return (*eface)(unsafe.Pointer(&obj))
 }
 
@@ -256,7 +253,7 @@ func (t *Tensor) Reshape(newShape []int64) error {
 // For example:
 // Tensor(int64, 0): int64
 // Tensor(float64, 3): [][][]float64
-func (t *Tensor) Value() interface{} {
+func (t *Tensor) Value() any {
 	raw := tensorData(t.c)
 	shape := t.Shape()
 	dt := t.DataType()
@@ -422,11 +419,17 @@ func shapeAndDataTypeOf(val reflect.Value) (shape []int64, dt DataType, err erro
 	typ := val.Type()
 	for typ.Kind() == reflect.Array || typ.Kind() == reflect.Slice {
 		shape = append(shape, int64(val.Len()))
+		// If slice elements are slices, verify that all of them have the same size.
+		// Go's type system makes that guarantee for arrays.
 		if val.Len() > 0 {
-			// In order to check tensor structure properly in general case we need to iterate over all slices of the tensor to check sizes match
-			// Since we already going to iterate over all elements in encodeTensor() let's
-			// 1) do the actual check in encodeTensor() to save some cpu cycles here
-			// 2) assume the shape is represented by lengths of elements with zero index in each dimension
+			if val.Type().Elem().Kind() == reflect.Slice {
+				expected := val.Index(0).Len()
+				for i := 1; i < val.Len(); i++ {
+					if val.Index(i).Len() != expected {
+						return shape, dt, fmt.Errorf("mismatched slice lengths: %d and %d", val.Index(i).Len(), expected)
+					}
+				}
+			}
 			val = val.Index(0)
 		}
 		typ = typ.Elem()
@@ -539,7 +542,7 @@ func copyPtr(w *bytes.Buffer, ptr unsafe.Pointer, l int) (int, error) {
 	return w.Write(b)
 }
 
-func bug(format string, args ...interface{}) error {
+func bug(format string, args ...any) error {
 	return fmt.Errorf("BUG: Please report at https://github.com/tensorflow/tensorflow/issues with the note: Go TensorFlow %v: %v", Version(), fmt.Sprintf(format, args...))
 }
 
@@ -553,7 +556,7 @@ func isTensorSerializable(dataType DataType) error {
 	// serialization and deserialization of Tensors.  Till then capitalize
 	// on knowledge of the implementation for numeric types.
 	switch dataType {
-	case Float, Double, Int32, Uint8, Int16, Int8, Complex, Int64, Bool, Quint8, Qint32, Bfloat16, Qint16, Quint16, Uint16, Complex128, Half:
+	case Float, Double, Int32, Uint8, Int16, Int8, Complex, Int64, Bool, Quint8, Qint32, Bfloat16, Qint16, Quint16, Uint16, Complex128, Half, Float8e5m2, Float8e4m3fn:
 		return nil
 	default:
 		return fmt.Errorf("serialization of tensors with the DataType %d is not yet supported, see https://github.com/tensorflow/tensorflow/issues/6003", dataType)

@@ -72,12 +72,15 @@ TEST(TensorSliceTest, Serialization) {
     TensorSlice s = TensorSlice::ParseOrDie("-:-:1,3:4,5");
     TensorSliceProto proto;
     s.AsProto(&proto);
-    EXPECT_EQ(
+    TensorSliceProto expected_slice_proto;
+    protobuf::TextFormat::ParseFromString(
         "extent { } "
         "extent { } "
         "extent { start: 1 length: 3 } "
         "extent { start: 4 length: 5 }",
-        proto.ShortDebugString());
+        &expected_slice_proto);
+    EXPECT_EQ(proto.ShortDebugString(),
+              expected_slice_proto.ShortDebugString());
     EXPECT_TRUE(!s.IsFull());
   }
 
@@ -87,7 +90,7 @@ TEST(TensorSliceTest, Serialization) {
     Status s = TensorSlice::Parse("-:-:1,3:4:5", &slice);
     EXPECT_EQ(s.code(), error::INVALID_ARGUMENT);
     EXPECT_TRUE(
-        absl::StrContains(s.error_message(),
+        absl::StrContains(s.message(),
                           "Expected a pair of numbers or '-' but got '4': "
                           "string = -:-:1,3:4:5"));
   }
@@ -96,7 +99,7 @@ TEST(TensorSliceTest, Serialization) {
     Status s = TensorSlice::Parse("-:-1,3", &slice);
     EXPECT_EQ(s.code(), error::INVALID_ARGUMENT);
     EXPECT_TRUE(absl::StrContains(
-        s.error_message(),
+        s.message(),
         "Expected non-negative start and positive length but got "
         "start = -1, length = 3: string = -:-1,3"));
   }
@@ -107,9 +110,12 @@ TEST(TensorSliceTest, Serialization) {
         TensorSlice::ParseOrDie("9223372036854775807,9223372036854775807");
     TensorSliceProto proto;
     s.AsProto(&proto);
-    EXPECT_EQ(
+    TensorSliceProto expected_slice_proto;
+    protobuf::TextFormat::ParseFromString(
         "extent { start: 9223372036854775807 length: 9223372036854775807 }",
-        proto.ShortDebugString());
+        &expected_slice_proto);
+    EXPECT_EQ(proto.ShortDebugString(),
+              expected_slice_proto.ShortDebugString());
     EXPECT_TRUE(!s.IsFull());
   }
 
@@ -120,7 +126,7 @@ TEST(TensorSliceTest, Serialization) {
         TensorSlice::Parse("19223372036854775808,19223372036854775808", &slice);
     EXPECT_EQ(s.code(), error::INVALID_ARGUMENT);
     EXPECT_TRUE(absl::StrContains(
-        s.error_message(),
+        s.message(),
         "Expected a pair of numbers or '-' but got "
         "'19223372036854775808,19223372036854775808': string = "
         "19223372036854775808,19223372036854775808"));
@@ -242,7 +248,7 @@ TEST(TensorSliceTest, SliceTensorShape) {
     TensorShape y;
     Status s = a.SliceTensorShape(x, &y);
     EXPECT_EQ(s.code(), error::INTERNAL);
-    EXPECT_TRUE(absl::StrContains(s.error_message(),
+    EXPECT_TRUE(absl::StrContains(s.message(),
                                   "Extent in dimension 1 out of bounds: "
                                   "shape = [2,4,5,8], slice = 1,1:1,4:-:-"));
     EXPECT_EQ("[]", y.DebugString());

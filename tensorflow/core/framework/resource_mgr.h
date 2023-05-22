@@ -22,6 +22,7 @@ limitations under the License.
 #include <typeinfo>
 #include <unordered_map>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/types/variant.h"
 #include "tensorflow/core/framework/common_shape_fns.h"
 #include "tensorflow/core/framework/device_attributes.pb.h"
@@ -199,8 +200,8 @@ class ResourceMgr {
   template <typename T, bool use_dynamic_cast = false>
   Status LookupMany(absl::Span<std::pair<const string*, const string*> const>
                         containers_and_names,
-                    std::vector<std::unique_ptr<T, core::RefCountDeleter>>*
-                        resources) const TF_MUST_USE_RESULT;
+                    std::vector<core::RefCountPtr<T>>* resources) const
+      TF_MUST_USE_RESULT;
 
   // If "container" has a resource "name", returns it in
   // "*resource". Otherwise, invokes creator() to create the resource.
@@ -248,16 +249,13 @@ class ResourceMgr {
       return (x.second == y.second) && (x.first == y.first);
     }
   };
-  typedef absl::variant<core::RefCountPtr<ResourceBase>,
-                        core::WeakPtr<ResourceBase>>
-      StrongOrWeakResourcePtr;
-
   struct ResourceAndName {
-    StrongOrWeakResourcePtr resource;
-    std::unique_ptr<string> name;
+    absl::variant<core::RefCountPtr<ResourceBase>, core::WeakPtr<ResourceBase>>
+        resource;
+    std::unique_ptr<std::string> name;
 
     ResourceAndName();
-    ResourceAndName(StrongOrWeakResourcePtr&& resource, std::string name);
+    explicit ResourceAndName(const string& name);
     ResourceAndName(ResourceAndName&& other) noexcept;
     ~ResourceAndName();
 
@@ -270,11 +268,12 @@ class ResourceMgr {
    private:
     TF_DISALLOW_COPY_AND_ASSIGN(ResourceAndName);
   };
-  typedef std::unordered_map<Key, ResourceAndName, KeyHash, KeyEqual> Container;
+  typedef absl::flat_hash_map<Key, ResourceAndName, KeyHash, KeyEqual>
+      Container;
 
   const std::string default_container_;
   mutable mutex mu_;
-  std::unordered_map<string, Container*> containers_ TF_GUARDED_BY(mu_);
+  absl::flat_hash_map<string, Container*> containers_ TF_GUARDED_BY(mu_);
 
   template <typename T, bool use_dynamic_cast = false>
   Status LookupInternal(const std::string& container, const std::string& name,
@@ -659,7 +658,7 @@ template <typename T, bool use_dynamic_cast>
 Status ResourceMgr::LookupMany(
     absl::Span<std::pair<const string*, const string*> const>
         containers_and_names,
-    std::vector<std::unique_ptr<T, core::RefCountDeleter>>* resources) const {
+    std::vector<core::RefCountPtr<T>>* resources) const {
   CheckDeriveFromResourceBase<T>();
   tf_shared_lock l(mu_);
   resources->resize(containers_and_names.size());
@@ -672,7 +671,7 @@ Status ResourceMgr::LookupMany(
       (*resources)[i].reset(resource);
     }
   }
-  return Status::OK();
+  return OkStatus();
 }
 
 // Simple wrapper to allow conditional dynamic / static casts.
@@ -769,7 +768,7 @@ template <typename T>
 Status ValidateDeviceAndType(OpKernelContext* ctx, const ResourceHandle& p) {
   TF_RETURN_IF_ERROR(internal::ValidateDevice(ctx, p));
   TF_RETURN_IF_ERROR(p.ValidateType<T>());
-  return Status::OK();
+  return OkStatus();
 }
 
 }  // namespace internal
@@ -796,7 +795,7 @@ Status LookupResource(OpKernelContext* ctx, const ResourceHandle& p,
     TF_ASSIGN_OR_RETURN(*value, p.GetResource<T>());
     // Transfers out a new reference.
     (*value)->Ref();
-    return Status::OK();
+    return OkStatus();
   }
 
   return ctx->resource_manager()->Lookup<T, use_dynamic_cast>(p.container(),
@@ -817,7 +816,7 @@ Status LookupResource(OpKernelContext* ctx, const ResourceHandle& p,
   TF_RETURN_IF_ERROR(LookupResource<T, false>(ctx, p, &raw_ptr));
   value->reset(raw_ptr);
 
-  return Status::OK();
+  return OkStatus();
 }
 
 // Similar to Lookup, but looks up multiple resources at once, with only a
@@ -864,7 +863,7 @@ Status LookupOrCreateResource(OpKernelContext* ctx, const ResourceHandle& p,
   TF_RETURN_IF_ERROR(LookupOrCreateResource<T>(ctx, p, &raw_ptr, creator));
   value->reset(raw_ptr);
 
-  return Status::OK();
+  return OkStatus();
 }
 
 // Deletes the resource pointed by "p", using the resource manager in "ctx".
@@ -875,7 +874,7 @@ Status DeleteResource(OpKernelContext* ctx, const ResourceHandle& p) {
   // NOTE(feyu): if we can convert all resources handle to ref-counting, then
   // DeleteResource can be removed.
   if (p.IsRefCounting()) {
-    return Status::OK();
+    return OkStatus();
   }
   return ctx->resource_manager()->Delete<T>(p.container(), p.name());
 }

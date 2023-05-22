@@ -1,4 +1,3 @@
-# Lint as: python3
 # Copyright 2017 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,17 +15,16 @@
 """An XLA client in Python."""
 
 import atexit
-import collections
 import contextlib
 import enum  # pylint: disable=g-bad-import-order
 import gzip
 import inspect
+import logging
 import os
-from typing import List, Sequence, Tuple, Union
+from typing import Any, List, Mapping, Optional, Sequence, Tuple, Union
 
 from . import xla_extension as _xla
-
-from absl import logging
+import ml_dtypes
 import numpy as np
 
 # Note this module does *not* depend on any Python protocol buffers. The XLA
@@ -46,26 +44,32 @@ profiler = _xla.profiler
 
 # Just an internal arbitrary increasing number to help with backward-compatible
 # changes.
-_version = 39
+_version = 154
+
+# Version number for MLIR:Python components.
+mlir_api_version = 49
 
 xla_platform_names = {
     'cpu': 'Host',
     'gpu': 'CUDA',
 }
 
+logger = logging.getLogger(__name__)
+
+_NameValueMapping = Mapping[str, Union[str, int, List[int], float]]
+
 
 def make_interpreter_client():
   return _xla.get_interpreter_client()
 
 
-def make_cpu_client(*, use_tfrt=False):
-  if use_tfrt:
-    return _xla.get_tfrt_cpu_client(asynchronous=True)
-  else:
-    return _xla.get_cpu_client(asynchronous=True)
+def make_cpu_client(*, use_tfrt: bool = True) -> ...:
+  assert use_tfrt
+  return _xla.get_tfrt_cpu_client(asynchronous=True)
 
 
-def make_gpu_client(distributed_client=None, node_id=0):
+def make_gpu_client(distributed_client=None, node_id=0, platform_name=None,
+                    allowed_devices=None):
   """Returns a GPU client. BFC allocator is used by default."""
   allocator = os.getenv('XLA_PYTHON_CLIENT_ALLOCATOR', 'default').lower()
   memory_fraction = os.getenv('XLA_PYTHON_CLIENT_MEM_FRACTION')
@@ -91,78 +95,108 @@ def make_gpu_client(distributed_client=None, node_id=0):
       asynchronous=True,
       allocator_config=config,
       distributed_client=distributed_client,
-      node_id=node_id)
+      node_id=node_id,
+      platform_name=platform_name,
+      allowed_devices=allowed_devices)
 
 
-def make_tpu_client():
-  return _xla.get_tpu_client(max_inflight_computations=32)
+def make_tfrt_tpu_c_api_client(options: Optional[_NameValueMapping] = None):
+  if options is None:
+    options = {}
+  return _xla.get_c_api_client('tpu', options)
 
 
-# Deprecated client factory API.
-
-# Backend factories, keyed by user-visible name, in increasing priority order.
-_local_backend_factories = collections.OrderedDict([
-    ('interpreter', make_interpreter_client),
-    ('cpu', make_cpu_client),
-    ('gpu', make_gpu_client),
-    ('tpu', make_tpu_client),
-])
+DeviceTopology = _xla.DeviceTopology
 
 
-def register_local_backend_factory(name, factory):
-  _local_backend_factories[name] = factory
+def make_tfrt_tpu_c_api_device_topology(
+    topology_name: Optional[str] = None, **kwargs
+) -> DeviceTopology:
+  """Creates a PJRT C API TopologyDescription."""
+
+  if not _use_pjrt_c_api():
+    raise NotImplementedError(
+        'make_tfrt_tpu_c_api_device_topology only works with the pjrt c-api.'
+    )
+  if topology_name is not None or kwargs:
+    raise NotImplementedError(
+        'Unsupported arguments to'
+        ' make_tfrt_tpu_c_api_device_topology(topology_name=%s, %s)'
+        % (repr(topology_name), repr(kwargs))
+    )
+  return _xla.get_default_c_api_topology('tpu')
 
 
-_local_backends = None
+def pjrt_plugin_loaded(plugin_name: str) -> bool:
+  return _xla.pjrt_plugin_loaded(plugin_name)
 
 
-def _get_local_backends():
-  """Instantiates all known local backends."""
-  global _local_backends
-  if _local_backends is not None:
-    return _local_backends
-
-  _local_backends = collections.OrderedDict()
-  for name, factory in _local_backend_factories.items():
-    logging.vlog(1, "Initializing backend '%s'" % name)
-    try:
-      backend = factory()
-    except RuntimeError as err:
-      if name == 'cpu':
-        # We always expect CPU to initialize successfully.
-        raise
-      else:
-        # If the backend isn't built into the binary, or if it has no devices,
-        # we expect a RuntimeError.
-        logging.vlog(1, "Error initializing backend '%s': %s" % (name, err))
-        continue
-    _local_backends[name] = backend
-  return _local_backends
+def load_pjrt_plugin_dynamically(plugin_name: str, library_path: str) -> None:
+  _xla.load_pjrt_plugin(plugin_name, library_path)
 
 
-def get_local_backend(name=None):
-  """Returns a local backend.
+def make_c_api_client(
+    plugin_name: str,
+    options: Optional[_NameValueMapping] = None,
+):
+  """Creates a PJRT C API client for a PJRT plugin.
+
+  It is required that load_pjrt_plugin_dynamically is called once with the same
+  plugin_name before this method is called.
 
   Args:
-    name: the backend name. If `None`, a default local backend is returned,
-      typically `gpu` if one is present, or `cpu` if not. If a string, the named
-      backend is returned or an exception raised.
+     plugin_name: the name of the PJRT plugin.
+     options: extra platform-specific options.
 
   Returns:
-    A LocalBackend object.
+     A PJRT C API client for plugin_name.
   """
-  backends = _get_local_backends()
-  if name is not None:
-    try:
-      return backends[name]
-    except KeyError:
-      raise RuntimeError('Unknown backend %s. Available: %s' %
-                         (name, list(backends.keys())))
-
-  return list(backends.values())[-1]
+  if options is None:
+    options = {}
+  return _xla.get_c_api_client(plugin_name, options)
 
 
-class OpMetadata(object):
+def _use_pjrt_c_api() -> bool:
+  use_pjrt_c_api = os.getenv('JAX_USE_PJRT_C_API_ON_TPU', 'false')
+  if use_pjrt_c_api not in ('1', '0', 'true', 'false'):
+    raise ValueError(
+        'JAX_USE_PJRT_C_API_ON_TPU env var must be "0", "1", "true" or '
+        f'"false", got "{use_pjrt_c_api}"')
+  return use_pjrt_c_api in ('1', 'true')
+
+
+def make_tpu_client(use_pjrt_c_api: bool = False):
+  """Returns a TPU client. Defaults to allowing 32 in-flight computations."""
+  if use_pjrt_c_api or _use_pjrt_c_api():
+    library_path = os.getenv('TPU_LIBRARY_PATH', 'libtpu.so')
+    load_pjrt_plugin_dynamically('tpu', library_path)
+    return make_tfrt_tpu_c_api_client()
+
+  max_inflight_computations = os.getenv(
+      'JAX_TPU_MAX_INFLIGHT_COMPUTATIONS', '32')
+  try:
+    max_inflight_computations = int(max_inflight_computations)
+  except ValueError as e:
+    raise ValueError(
+        f'JAX_TPU_MAX_INFLIGHT_COMPUTATIONS env var must be an int, '
+        f'got {max_inflight_computations}') from e
+  return _xla.get_tpu_client(
+      max_inflight_computations=max_inflight_computations)
+
+
+def make_plugin_device_client():
+  """Returns a plugin device client."""
+  try:
+    return _xla.get_plugin_device_client()
+  except AttributeError as e:
+    raise AttributeError(
+        'xla_extension has no attributes named get_plugin_device_client. '
+        'Compile TensorFlow with '
+        '//tensorflow/compiler/xla/python:enable_plugin_device set to true '
+        '(defaults to false) to enable this.') from e
+
+
+class OpMetadata:
   """Python representation of a xla.OpMetadata protobuf."""
   __slots__ = ('op_type', 'op_name', 'source_file', 'source_line')
 
@@ -186,7 +220,10 @@ def CurrentSourceInfoMetadata(op_type=None, op_name=None, skip_frames=1):
 
 PrimitiveType = _xla.PrimitiveType
 
-bfloat16 = _xla.bfloat16_dtype()
+bfloat16 = ml_dtypes.bfloat16
+float8_e4m3fn = ml_dtypes.float8_e4m3fn
+float8_e4m3b11fnuz = ml_dtypes.float8_e4m3b11
+float8_e5m2 = ml_dtypes.float8_e5m2
 
 XLA_ELEMENT_TYPE_TO_DTYPE = {
     PrimitiveType.PRED: np.dtype('bool'),
@@ -198,6 +235,9 @@ XLA_ELEMENT_TYPE_TO_DTYPE = {
     PrimitiveType.U16: np.dtype('uint16'),
     PrimitiveType.U32: np.dtype('uint32'),
     PrimitiveType.U64: np.dtype('uint64'),
+    PrimitiveType.F8E4M3FN: np.dtype(float8_e4m3fn),
+    PrimitiveType.F8E4M3B11FNUZ: np.dtype(float8_e4m3b11fnuz),
+    PrimitiveType.F8E5M2: np.dtype(float8_e5m2),
     PrimitiveType.BF16: np.dtype(bfloat16),
     PrimitiveType.F16: np.dtype('float16'),
     PrimitiveType.F32: np.dtype('float32'),
@@ -225,7 +265,7 @@ Shape = _xla.Shape
 Shape.__doc__ = """
 A Shape is an object defined in C++ that duck types like the following class:
 
-class Shape(object):
+class Shape:
   '''Represents an XLA shape.
 
   A shape is either an array shape, having rank-many integer
@@ -274,7 +314,7 @@ ProgramShape = _xla.ProgramShape
 ProgramShape.__doc__ = """
 A ProgramShape is a C++ object that duck types like the following class.
 
-class ProgramShape(object):
+class ProgramShape:
   def __init__(self, parameter_shapes, result_shape):
   def parameter_shapes(self) -> [Shape]:
   def result_shape(self) -> Shape:
@@ -285,7 +325,7 @@ ShapeIndex = _xla.ShapeIndex
 ShapeIndex.__doc__ = """
 A Shape is an object defined in C++ that duck types like the following class:
 
-class ShapeIndex(object):
+class ShapeIndex:
   '''Represents an XLA ShapeIndex.
 
   An index for specifying a particular nested subshape within a shape. Used in
@@ -341,7 +381,7 @@ CompileOptions = _xla.CompileOptions
 HostBufferSemantics = _xla.HostBufferSemantics
 
 # An Executable is a C++ class that duck types with the following API:
-# class Executable(object):
+# class Executable:
 #   def local_devices(self) -> [Device]:
 #   def execute(self, arguments : [Buffer]) -> Buffer:
 #     """Execute on one replica with Buffer arguments and return value."""
@@ -374,7 +414,7 @@ def execute_with_python_values(executable, arguments, backend):
 
   arguments = [put(arg) for arg in arguments]
   outputs = executable.execute(arguments)
-  return [x.to_py() for x in outputs]
+  return [np.asarray(x) for x in outputs]
 
 
 def execute_with_python_values_replicated(executable, arguments, backend):
@@ -397,7 +437,7 @@ def execute_with_python_values_replicated(executable, arguments, backend):
 
   inputs = [copy_to_devices(pyvals) for pyvals in zip(*arguments)]
   outputs = executable.execute_sharded_on_local_devices(inputs)
-  return [[x.to_py() for x in xs] for xs in zip(*outputs)]
+  return [[np.asarray(x) for x in xs] for xs in zip(*outputs)]
 
 
 class PaddingType(enum.Enum):
@@ -441,13 +481,40 @@ XlaComputation = _xla.XlaComputation
 XlaOp = _xla.XlaOp
 FftType = _xla.FftType
 Client = _xla.Client
-Buffer = _xla.Buffer
-DeviceArrayBase = _xla.DeviceArrayBase
-Executable = _xla.Executable
-OpSharding = _xla.OpSharding  # type: ignore
+ArrayImpl = _xla.ArrayImpl
+LoadedExecutable = _xla.LoadedExecutable
+OpSharding = _xla.OpSharding
+HloSharding = _xla.HloSharding
+Sharding = _xla.Sharding
+XLACompatibleSharding = _xla.XLACompatibleSharding
+NamedSharding = _xla.NamedSharding
+SingleDeviceSharding = _xla.SingleDeviceSharding
+PmapSharding = _xla.PmapSharding
+GSPMDSharding = _xla.GSPMDSharding
 
 
-def register_custom_call_target(name, fn, platform='cpu'):
+def LoadedExecutable_execute(self, arguments, device=None):
+  del device
+  results = self.execute_sharded(arguments)
+  return [x[0] for x in results.disassemble_into_single_device_arrays()]
+
+
+def LoadedExecutable_execute_with_token(self, arguments, device=None):
+  del device
+  results = self.execute_sharded(arguments, with_tokens=True)
+  return (
+      [x[0] for x in results.disassemble_into_single_device_arrays()],
+      results.consume_token().get_token(0),
+  )
+
+
+LoadedExecutable.execute = LoadedExecutable_execute
+LoadedExecutable.execute_with_token = LoadedExecutable_execute_with_token
+
+
+def register_custom_call_target(
+    name: str, fn: Any, platform: str = 'cpu'
+) -> None:
   """Registers a custom call target.
 
   Args:
@@ -463,11 +530,18 @@ def register_custom_call_target(name, fn, platform='cpu'):
 
 # Deprecated. Use register_custom_call_target instead.
 register_cpu_custom_call_target = register_custom_call_target
+register_custom_call_partitioner = _xla.register_custom_call_partitioner
+encode_inspect_sharding_callback = _xla.encode_inspect_sharding_callback
+hlo_sharding_util = _xla.hlo_sharding_util
 
 
-class PaddingConfigDimension(object):
+class PaddingConfigDimension:
   """Python representation of a xla.PaddingConfigDimension protobuf."""
   __slots__ = ('edge_padding_low', 'edge_padding_high', 'interior_padding')
+
+  edge_padding_low: int
+  edge_padding_high: int
+  interior_padding: int
 
   def __init__(self):
     self.edge_padding_low = 0
@@ -475,7 +549,7 @@ class PaddingConfigDimension(object):
     self.interior_padding = 0
 
 
-class PaddingConfig(object):
+class PaddingConfig:
   """Python representation of a xla.PaddingConfig protobuf."""
   __slots__ = ('dimensions',)
 
@@ -508,7 +582,7 @@ def make_padding_config(
   return padding_config
 
 
-class DotDimensionNumbers(object):
+class DotDimensionNumbers:
   """Python representation of a xla.DotDimensionNumbers protobuf."""
   __slots__ = ('lhs_contracting_dimensions', 'rhs_contracting_dimensions',
                'lhs_batch_dimensions', 'rhs_batch_dimensions')
@@ -548,7 +622,7 @@ def make_dot_dimension_numbers(
     return dimension_numbers
 
 
-class ConvolutionDimensionNumbers(object):
+class ConvolutionDimensionNumbers:
   """Python representation of a xla.ConvolutionDimensionNumbers protobuf."""
   __slots__ = ('input_batch_dimension', 'input_feature_dimension',
                'input_spatial_dimensions', 'kernel_input_feature_dimension',
@@ -632,7 +706,7 @@ def make_convolution_dimension_numbers(
   return dimension_numbers
 
 
-class PrecisionConfig(object):
+class PrecisionConfig:
   """Python representation of a xla.PrecisionConfig protobuf."""
   __slots__ = ('operand_precision',)
 
@@ -642,7 +716,7 @@ class PrecisionConfig(object):
     self.operand_precision = []
 
 
-class GatherDimensionNumbers(object):
+class GatherDimensionNumbers:
   """Python representation of a xla.GatherDimensionNumbers protobuf."""
   __slots__ = ('offset_dims', 'collapsed_slice_dims', 'start_index_map',
                'index_vector_dim')
@@ -654,7 +728,7 @@ class GatherDimensionNumbers(object):
     self.index_vector_dim = 0
 
 
-class ScatterDimensionNumbers(object):
+class ScatterDimensionNumbers:
   """Python representation of a xla.ScatterDimensionNumbers protobuf."""
   __slots__ = ('update_window_dims', 'inserted_window_dims',
                'scatter_dims_to_operand_dims', 'index_vector_dim')
@@ -666,7 +740,7 @@ class ScatterDimensionNumbers(object):
     self.index_vector_dim = 0
 
 
-class ReplicaGroup(object):
+class ReplicaGroup:
   """Python representation of a xla.ReplicaGroup protobuf."""
   __slots__ = ('replica_ids',)
 
@@ -711,6 +785,13 @@ def heap_profile(client: Client) -> bytes:
   return gzip.compress(client.heap_profile())
 
 
+XlaRuntimeError = _xla.XlaRuntimeError
+
 # Perform one last garbage collection of deferred Python references. This is
 # mostly to keep ASAN happy.
 atexit.register(_xla.collect_garbage)
+
+weakref_lru_cache = _xla.weakref_lru_cache
+array_result_handler = _xla.array_result_handler
+copy_array_to_devices_with_sharding = _xla.copy_array_to_devices_with_sharding
+batched_device_put = _xla.batched_device_put

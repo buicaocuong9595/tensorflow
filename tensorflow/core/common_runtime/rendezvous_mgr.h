@@ -45,14 +45,25 @@ class RefCountedIntraProcessRendezvous : public Rendezvous {
   explicit RefCountedIntraProcessRendezvous(const DeviceMgr* device_mgr);
 
   // Implementation of RendezvousInterface methods.
+  // NOTE: The methods may clear the Item list and destroy 'this' if there are
+  // no other references to the RefCountedIntraProcessRendezvous object.
+  // If the caller intend to keep a longer life time then it shall keep its own
+  // reference to the RefCountedIntraProcessRendezvous.
   Status Send(const ParsedKey& key, const Rendezvous::Args& args,
               const Tensor& val, const bool is_dead) override;
   void RecvAsync(const ParsedKey& key, const Rendezvous::Args& args,
                  DoneCallback done) override;
   void StartAbort(const Status& status) override;
 
+  // Returns the member LocalRendezvous' status.
+  Status GetLocalRendezvousStatus();
+
+  inline void UpdateDeviceManager(DeviceMgr* device_mgr) {
+    device_mgr_ = device_mgr;
+  }
+
  private:
-  const DeviceMgr* device_mgr_;
+  const DeviceMgr* device_mgr_;  // Not owned.
   LocalRendezvous local_;
 
   ~RefCountedIntraProcessRendezvous() override;
